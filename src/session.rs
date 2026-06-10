@@ -14,6 +14,10 @@ use std::path::PathBuf;
 pub struct SessionState {
     pub tab: Tab,
     pub timeframe: Timeframe,
+    #[serde(default)]
+    pub selected_iterations: Vec<String>,
+    #[serde(default)]
+    pub item_types: Vec<String>,
     pub current_id: Option<u32>,
     pub tree_expanded: Vec<u32>,
     pub tree_selected: usize,

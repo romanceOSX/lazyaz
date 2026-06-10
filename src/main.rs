@@ -9,10 +9,8 @@ mod ui;
 
 use anyhow::{Context, Result};
 use api::azure::AzureClient;
-use api::mock::MockClient;
 use api::WorkItemClient;
 use app::{App, EditorRequest};
-use auth::mock::MockAuthenticator;
 use auth::oauth::OAuthAuthenticator;
 use auth::pat::PatAuthenticator;
 use auth::{AuthScheme, AuthState, Authenticator};
@@ -34,7 +32,7 @@ fn main() -> Result<()> {
     let want_login = args.iter().any(|a| a == "--login");
 
     let cfg = Config::load().unwrap_or_default();
-    let (client, auth, backend_note) = build_backends(&cfg, want_login);
+    let (client, auth, backend_note) = build_backends(&cfg, want_login)?;
     let mut app = App::with_backends(cfg, client, auth);
     app.status = backend_note;
     if force_wizard {
@@ -50,47 +48,52 @@ fn main() -> Result<()> {
     result
 }
 
-/// Choose the backend: PAT (env) → OAuth (cached/`--login`) → offline mock.
-fn build_backends(
-    cfg: &Config,
-    want_login: bool,
-) -> (Box<dyn WorkItemClient>, Box<dyn Authenticator>, String) {
+/// A constructed work-item backend: client, authenticator, and a status note.
+type Backend = (Box<dyn WorkItemClient>, Box<dyn Authenticator>, String);
+
+/// Choose the backend: PAT (env) or Entra ID OAuth (cached token / device sign-in).
+/// There is no offline fallback — lazyaz always talks to the real Azure DevOps API.
+fn build_backends(cfg: &Config, want_login: bool) -> Result<Backend> {
     // 1. Personal Access Token from the environment.
     if let Ok(pat) = std::env::var("AZURE_DEVOPS_PAT")
         && !pat.trim().is_empty() && cfg.is_complete() {
             let account = std::env::var("AZURE_DEVOPS_ACCOUNT").unwrap_or_else(|_| "PAT".into());
             let state = AuthState { account, token: pat, scheme: AuthScheme::BasicPat };
-            let client = AzureClient::new(cfg.org_url.clone(), cfg.project.clone(), state.header());
-            return (
+            let client = AzureClient::new(
+                cfg.org_url.clone(),
+                cfg.project.clone(),
+                cfg.team.clone(),
+                state.header(),
+            );
+            return Ok((
                 Box::new(client),
                 Box::new(PatAuthenticator::new(state)),
                 "Azure DevOps (PAT)".into(),
-            );
+            ));
         }
 
-    // 2. Entra ID OAuth: use a cached token, or sign in when asked.
+    // 2. Entra ID OAuth: use a cached token, or sign in via the device-code
+    //    flow. We build the real backend even before org/project are configured
+    //    so the first-run wizard can list the user's actual orgs and projects.
     let mut oauth = OAuthAuthenticator::new();
-    if oauth.token().is_none() && want_login
-        && let Err(e) = oauth.login() {
-            eprintln!("sign-in failed ({e}); starting in offline mode");
-        }
-    if let Some(token) = oauth.token()
-        && cfg.is_complete() {
-            let header = format!("Bearer {token}");
-            let client = AzureClient::new(cfg.org_url.clone(), cfg.project.clone(), header);
-            return (
-                Box::new(client),
-                Box::new(oauth),
-                "Azure DevOps (OAuth)".into(),
-            );
-        }
-
-    // 3. Offline: mock data so the app is usable without an account.
-    (
-        Box::new(MockClient::new()),
-        Box::new(MockAuthenticator::default()),
-        "offline demo — mock data (set AZURE_DEVOPS_PAT or run with --login)".into(),
-    )
+    if oauth.token().is_none() || want_login {
+        oauth.login().context("Entra ID sign-in failed")?;
+    }
+    let token = oauth
+        .token()
+        .context("no Azure DevOps credentials available")?;
+    let header = format!("Bearer {token}");
+    let client = AzureClient::new(
+        cfg.org_url.clone(),
+        cfg.project.clone(),
+        cfg.team.clone(),
+        header,
+    );
+    Ok((
+        Box::new(client),
+        Box::new(oauth),
+        "Azure DevOps (OAuth)".into(),
+    ))
 }
 
 fn print_usage() {
@@ -107,8 +110,8 @@ OPTIONS:
 
 AUTH:
     Set AZURE_DEVOPS_PAT (and have org/project configured) to use a Personal
-    Access Token, or pass --login for an interactive Entra ID sign-in (the token
-    is cached). With neither, lazyaz runs offline against mock data.
+    Access Token. Otherwise lazyaz signs you in with Entra ID via the device-code
+    flow (the token is cached) — a sign-in is required to reach Azure DevOps.
 
 With no options, lazyaz opens normally and runs the setup wizard automatically
 on first launch (when no config exists)."
@@ -125,13 +128,24 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
             continue;
         }
 
-        // Short poll keeps the conflict pulse animating and drives periodic refresh.
-        if cevent::poll(Duration::from_millis(200))?
+        // Wait for input. While a conflict menu is open or a refresh is in
+        // flight we tick fast so the pulsing border / loading spinner animate;
+        // otherwise we idle on a long timeout to avoid needless redraws.
+        let tick = if app.resolution.is_some() || app.is_loading() || app.is_pushing() {
+            Duration::from_millis(120)
+        } else {
+            Duration::from_secs(1)
+        };
+        if cevent::poll(tick)?
             && let Event::Key(key) = cevent::read()?
                 && key.kind == cevent::KeyEventKind::Press {
                     event::handle_key(app, key);
                 }
         app.poll();
+        app.drain_refresh();
+        app.live_poll();
+        app.drain_live();
+        app.drain_push();
     }
     Ok(())
 }
@@ -147,7 +161,7 @@ fn run_editor(
         EditorRequest::EditComment { initial, .. } => initial.clone(),
         // Conflict merge: seed the editor with the conflict-marker text.
         EditorRequest::Merge { .. } => app.merge_seed.take().unwrap_or_default(),
-        EditorRequest::Comment { .. } => String::new(),
+        EditorRequest::Comment => String::new(),
     };
 
     let edited = with_suspended(terminal, || edit_in_editor(&initial))?;

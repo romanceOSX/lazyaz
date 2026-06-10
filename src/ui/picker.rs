@@ -4,9 +4,7 @@
 
 use crate::ui::input::TextInput;
 use crate::ui::theme;
-use crossterm::event::{KeyCode, KeyEvent};
-use fuzzy_matcher::skim::SkimMatcherV2;
-use fuzzy_matcher::FuzzyMatcher;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -36,18 +34,7 @@ impl Picker {
 
     /// Options matching the current query, ranked by fuzzy score.
     pub fn matches(&self) -> Vec<&String> {
-        let query = self.input.value();
-        if query.trim().is_empty() {
-            return self.options.iter().collect();
-        }
-        let matcher = SkimMatcherV2::default();
-        let mut scored: Vec<(i64, &String)> = self
-            .options
-            .iter()
-            .filter_map(|o| matcher.fuzzy_match(o, &query).map(|s| (s, o)))
-            .collect();
-        scored.sort_by_key(|(s, _)| std::cmp::Reverse(*s));
-        scored.into_iter().map(|(_, o)| o).collect()
+        crate::ui::fuzzy::rank(&self.options, &self.input.value(), |o| [o.as_str()])
     }
 
     pub fn current(&self) -> Option<String> {
@@ -56,6 +43,7 @@ impl Picker {
 
     /// Returns true if the key was handled (movement or text editing).
     pub fn handle(&mut self, key: KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Up => {
                 self.selected = self.selected.saturating_sub(1);
@@ -64,6 +52,28 @@ impl Picker {
             KeyCode::Down => {
                 let max = self.matches().len().saturating_sub(1);
                 self.selected = (self.selected + 1).min(max);
+                true
+            }
+            KeyCode::Char('p') if ctrl => {
+                self.selected = self.selected.saturating_sub(1);
+                true
+            }
+            KeyCode::Char('n') if ctrl => {
+                let max = self.matches().len().saturating_sub(1);
+                self.selected = (self.selected + 1).min(max);
+                true
+            }
+            // Tab / Ctrl-y autocomplete the highlighted option into the query,
+            // but only while in search mode (non-empty query); otherwise Tab
+            // falls through to the default (e.g. switch tab).
+            KeyCode::Tab | KeyCode::Char('y')
+                if (key.code != KeyCode::Char('y') || ctrl)
+                    && !self.input.value().trim().is_empty() =>
+            {
+                if let Some(opt) = self.current() {
+                    self.input = TextInput::new(&opt);
+                    self.selected = 0;
+                }
                 true
             }
             _ => {
@@ -109,5 +119,49 @@ impl Picker {
             rows[1],
             &mut state,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn ctrl_n_p_navigate() {
+        let mut p = Picker::new(vec!["alpha".into(), "beta".into(), "gamma".into()]);
+        assert_eq!(p.selected, 0);
+        p.handle(ctrl('n'));
+        assert_eq!(p.selected, 1);
+        p.handle(ctrl('p'));
+        assert_eq!(p.selected, 0);
+    }
+
+    #[test]
+    fn tab_and_ctrl_y_autocomplete_while_searching() {
+        let mut p = Picker::new(vec!["alpha".into(), "beta".into()]);
+        p.handle(key(KeyCode::Char('a')));
+        p.handle(key(KeyCode::Char('l')));
+        p.handle(key(KeyCode::Tab));
+        assert_eq!(p.input.value(), "alpha");
+
+        let mut p2 = Picker::new(vec!["alpha".into(), "beta".into()]);
+        p2.handle(key(KeyCode::Char('b')));
+        p2.handle(ctrl('y'));
+        assert_eq!(p2.input.value(), "beta");
+    }
+
+    #[test]
+    fn tab_falls_through_when_query_empty() {
+        let mut p = Picker::new(vec!["alpha".into()]);
+        // Not consumed by the picker → caller handles it (e.g. switch tab).
+        assert!(!p.handle(key(KeyCode::Tab)));
     }
 }

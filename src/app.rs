@@ -1,18 +1,29 @@
 use crate::api::mock::MockClient;
-use crate::api::models::{Timeframe, WorkItem};
+use crate::api::models::{Iteration, Timeframe, WorkItem, WorkItemFilter};
 use crate::api::WorkItemClient;
 use crate::auth::mock::MockAuthenticator;
 use crate::auth::Authenticator;
 use crate::config::Config;
 use crate::keys::{Action, Context};
+use crate::ui::date_range::DateRangeInput;
 use crate::ui::input::TextInput;
+use crate::ui::iteration_picker::IterationPicker;
 use crate::ui::picker::Picker;
+use crate::ui::type_filter::TypeFilter;
+use crate::ui::tags_editor::TagsEditor;
 use ratatui::widgets::ListState;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
-/// How often the app re-fetches server state to spot remote changes.
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// How often the app re-fetches server state to spot remote changes. Each poll
+/// is several blocking REST round trips on the UI thread, so keep it infrequent
+/// to avoid stutter; users can force an immediate refresh with the reload key.
+const POLL_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How often the open item alone is re-fetched for the live-feed (cheaper and
+/// more frequent than the full list refresh).
+const LIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Tab {
@@ -59,6 +70,8 @@ pub enum FieldKind {
     Multiline,
     /// Enum cycled in place (e.g. workflow state).
     State,
+    /// Tags, edited in the floating fuzzy tags editor.
+    Tags,
 }
 
 pub struct EditField {
@@ -74,7 +87,7 @@ pub const EDITABLE_FIELDS: &[EditField] = &[
     EditField { key: "state",       label: "State",       kind: FieldKind::State },
     EditField { key: "assignee",    label: "Assignee",    kind: FieldKind::Line },
     EditField { key: "iteration",   label: "Iteration",   kind: FieldKind::Line },
-    EditField { key: "tags",        label: "Tags",        kind: FieldKind::Line },
+    EditField { key: "tags",        label: "Tags",        kind: FieldKind::Tags },
     EditField { key: "description", label: "Description", kind: FieldKind::Multiline },
     EditField { key: "notes",       label: "Notes",       kind: FieldKind::Multiline },
 ];
@@ -126,34 +139,69 @@ pub const CONFIG_FIELDS: [&str; 4] = ["org_url", "project", "team", "account"];
 /// A request for the main loop to suspend the TUI and open `$EDITOR`.
 pub enum EditorRequest {
     Field {
-        id: u32,
         field: &'static str,
         initial: String,
-        base_rev: u32,
     },
     /// Resolving a conflict by hand-merging in the editor.
     Merge {
         id: u32,
         field: &'static str,
     },
-    Comment {
-        id: u32,
-    },
+    Comment,
     /// Editing an existing comment (last-write-wins, no conflict detection).
     EditComment {
-        id: u32,
         comment_id: u32,
         initial: String,
     },
 }
 
-/// A detected edit conflict: the user's local edit vs a newer server version.
-pub struct Conflict {
-    pub id: u32,
+/// A local edit that has not yet been pushed to the server. `base` is the
+/// server value we believe is the common ancestor (captured at first edit).
+#[derive(Clone, Debug)]
+pub struct PendingEdit {
+    pub field: &'static str,
+    pub base: String,
+    pub base_rev: u32,
+    pub value: String,
+}
+
+/// A local, un-pushed comment change. Like field edits, these are held until
+/// the user manually pushes.
+#[derive(Clone, Debug)]
+pub enum PendingComment {
+    /// A brand-new comment to be added on push.
+    Add { author: String, text: String },
+    /// An edit to an existing comment, applied on push.
+    Edit { comment_id: u32, text: String },
+    /// Deletion of an existing comment, applied on push.
+    Delete { comment_id: u32 },
+}
+
+/// One field whose local edit diverged from a newer server value.
+#[derive(Clone, Debug)]
+pub struct FieldConflict {
     pub field: &'static str,
     pub base: String,
     pub local: String,
     pub remote: String,
+}
+
+/// Floating resolution-options menu: shown only when a push (or an attempt to
+/// edit a live-feed–flagged field) detects genuine divergence.
+pub struct Resolution {
+    pub id: u32,
+    pub conflicts: Vec<FieldConflict>,
+    /// Highlighted conflicting field (for per-field merge).
+    pub selected: usize,
+}
+
+/// Live-feed status of a single field on the open item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldStatus {
+    /// Someone changed this field upstream and it clashes with our pending edit.
+    Conflicted,
+    /// The field was updated upstream with no conflict (latest content adopted).
+    Updated,
 }
 
 /// Fuzzy help popup state.
@@ -185,20 +233,53 @@ pub struct App {
     pub items: Vec<WorkItem>,
     pub list_state: ListState,
     pub timeframe: Timeframe,
+    /// Available iterations (sprints) for the configured team, fetched lazily.
+    pub iterations: Vec<Iteration>,
+    /// Iteration paths the list is filtered to (empty = no iteration filter).
+    pub selected_iterations: Vec<String>,
+    /// Floating iteration multi-select picker (modal), opened with `i`.
+    pub iteration_picker: Option<IterationPicker>,
+    /// Floating custom date-range entry (modal), opened with `c`.
+    pub date_range: Option<DateRangeInput>,
+    /// Whether iterations have been loaded & the default-to-current applied.
+    pub iterations_initialized: bool,
+
+    /// Work-item types the list is filtered to (empty = no type filter).
+    pub item_types: Vec<String>,
+    /// Floating work-item-type multi-select picker (modal), opened with `t`.
+    pub type_picker: Option<TypeFilter>,
+    /// Whether the default type filter has been applied on first async load.
+    pub item_types_initialized: bool,
 
     pub tree: TreeState,
 
     pub current: Option<WorkItem>,
+    /// Titles of the open item's parent/children, fetched once when the item is
+    /// opened (and refreshed in the background) so the relations pane never has
+    /// to hit the network while the user navigates panes.
+    pub related_titles: HashMap<u32, String>,
     pub detail_focus: DetailFocus,
     pub detail_selected: usize,
     pub comment_selected: usize,
     /// Floating field editor (modal), opened from the Info pane.
     pub info_editor: Option<InfoEditor>,
+    /// Floating state picker (modal), opened when editing the State field and
+    /// the backend supplied the item type's valid states.
+    pub state_picker: Option<Picker>,
+    /// Floating tags editor (modal), opened when editing the Tags field.
+    pub tags_editor: Option<TagsEditor>,
 
     pub wizard: Option<WizardState>,
     pub config_edit: ConfigEdit,
 
-    pub conflict: Option<Conflict>,
+    /// Un-pushed local edits to the open item, keyed by field (manual push).
+    pub pending: Vec<PendingEdit>,
+    /// Un-pushed local comment additions/edits to the open item.
+    pub pending_comments: Vec<PendingComment>,
+    /// Floating resolution-options menu, shown on genuine divergence.
+    pub resolution: Option<Resolution>,
+    /// Live-feed markers for the open item's fields (⚠ conflict / ✓ updated).
+    pub field_status: HashMap<&'static str, FieldStatus>,
 
     pub show_help: bool,
     pub help: HelpState,
@@ -210,6 +291,67 @@ pub struct App {
 
     started: Instant,
     last_poll: Instant,
+
+    /// True while a background refresh is in flight (drives the status spinner).
+    loading: bool,
+    /// Set when a refresh is requested while one is already running, so we fire
+    /// a fresh one as soon as the in-flight refresh completes.
+    pending_refresh: bool,
+    refresh_tx: Sender<RefreshOutcome>,
+    refresh_rx: Receiver<RefreshOutcome>,
+
+    /// Live-feed: periodic lightweight re-fetch of just the open item.
+    last_live: Instant,
+    live_inflight: bool,
+    live_tx: Sender<CurrentOutcome>,
+    live_rx: Receiver<CurrentOutcome>,
+
+    /// True while a manual push is uploading in the background (drives the status
+    /// bar's push spinner). The UI stays interactive during the push.
+    pushing: bool,
+    push_tx: Sender<PushOutcome>,
+    push_rx: Receiver<PushOutcome>,
+}
+
+/// Result of a background push of the open item's pending edits.
+enum PushOutcome {
+    /// Server diverged: genuine conflicts detected, nothing was uploaded. The
+    /// in-flight edits are returned so they can be restored for resolution.
+    Conflicts {
+        id: u32,
+        conflicts: Vec<FieldConflict>,
+        pending: Vec<PendingEdit>,
+        comments: Vec<PendingComment>,
+    },
+    /// Uploaded `total` change(s), `failed` of which errored.
+    Done { id: u32, total: usize, failed: usize },
+    /// The pre-flight fetch failed; edits are returned to restore them.
+    Error {
+        message: String,
+        pending: Vec<PendingEdit>,
+        comments: Vec<PendingComment>,
+    },
+}
+
+/// Result of a live-feed fetch of a single (open) work item.
+struct CurrentOutcome {
+    id: u32,
+    item: Result<WorkItem, String>,
+    /// Related-item titles refreshed alongside.
+    related: HashMap<u32, String>,
+}
+
+/// Result of a background refresh, sent from the worker thread to the UI thread.
+struct RefreshOutcome {
+    /// Filter the fetch was issued for; lets us drop stale results.
+    filter: WorkItemFilter,
+    items: Result<Vec<WorkItem>, String>,
+    /// Iterations fetched alongside (only when the list was empty / requested).
+    iterations: Option<Vec<Iteration>>,
+    /// Refreshed copy of the open item, if one was focused at request time.
+    current: Option<Result<WorkItem, String>>,
+    /// Titles of the refreshed item's related (parent/child) work items.
+    related: HashMap<u32, String>,
 }
 
 impl App {
@@ -233,6 +375,9 @@ impl App {
             project: Picker::new(Vec::new()),
         });
         let now = Instant::now();
+        let (refresh_tx, refresh_rx) = std::sync::mpsc::channel();
+        let (live_tx, live_rx) = std::sync::mpsc::channel();
+        let (push_tx, push_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             wizard,
             tab: Tab::Tree,
@@ -244,17 +389,31 @@ impl App {
             items: Vec::new(),
             list_state: ListState::default(),
             timeframe: Timeframe::All,
+            iterations: Vec::new(),
+            selected_iterations: Vec::new(),
+            iteration_picker: None,
+            date_range: None,
+            iterations_initialized: false,
+            item_types: Vec::new(),
+            type_picker: None,
+            item_types_initialized: false,
             tree: TreeState::default(),
             current: None,
+            related_titles: HashMap::new(),
             detail_focus: DetailFocus::Info,
             detail_selected: 0,
             comment_selected: 0,
             info_editor: None,
+            state_picker: None,
+            tags_editor: None,
             config_edit: ConfigEdit {
                 selected: 0,
                 buffer: TextInput::default(),
             },
-            conflict: None,
+            pending: Vec::new(),
+            pending_comments: Vec::new(),
+            resolution: None,
+            field_status: HashMap::new(),
             show_help: false,
             help: HelpState::default(),
             pending_g: false,
@@ -262,6 +421,17 @@ impl App {
             merge_seed: None,
             started: now,
             last_poll: now,
+            loading: false,
+            pending_refresh: false,
+            refresh_tx,
+            refresh_rx,
+            last_live: now,
+            live_inflight: false,
+            live_tx,
+            live_rx,
+            pushing: false,
+            push_tx,
+            push_rx,
             config,
         };
         if app.wizard.is_none() {
@@ -290,6 +460,14 @@ impl App {
             return;
         };
         self.timeframe = s.timeframe;
+        self.selected_iterations = s.selected_iterations;
+        self.item_types = s.item_types;
+        // Respect the restored (possibly empty) iteration selection rather than
+        // auto-defaulting to the current sprint on first iteration load.
+        self.iterations_initialized = true;
+        // Likewise respect the restored (possibly empty) type selection rather
+        // than re-applying the User Story + Feature default.
+        self.item_types_initialized = true;
         if !s.tree_expanded.is_empty() {
             self.tree.expanded = s.tree_expanded.into_iter().collect();
         }
@@ -302,7 +480,7 @@ impl App {
         // Reopen the previously focused item if it still exists.
         if let Some(id) = s.current_id
             && let Ok(item) = self.client.get(id) {
-                self.current = Some(item);
+                self.set_current(item);
                 self.detail_selected = s.detail_selected;
             }
         self.tab = s.tab;
@@ -318,6 +496,8 @@ impl App {
         let state = crate::session::SessionState {
             tab: self.tab,
             timeframe: self.timeframe,
+            selected_iterations: self.selected_iterations.clone(),
+            item_types: self.item_types.clone(),
             current_id: self.current.as_ref().map(|w| w.id),
             tree_expanded: self.tree.expanded.iter().copied().collect(),
             tree_selected: self.tree.selected,
@@ -328,11 +508,23 @@ impl App {
     }
 
     pub fn context(&self) -> Context {
-        if self.info_editor.is_some() {
+        if self.resolution.is_some() {
+            return Context::Conflict;
+        }
+        if self.iteration_picker.is_some() {
+            return Context::IterationFilter;
+        }
+        if self.date_range.is_some() {
+            return Context::IterationFilter;
+        }
+        if self.type_picker.is_some() {
+            return Context::TypeFilter;
+        }
+        if self.tags_editor.is_some() || self.state_picker.is_some() {
             return Context::InfoEditor;
         }
-        if self.conflict.is_some() {
-            return Context::Conflict;
+        if self.info_editor.is_some() {
+            return Context::InfoEditor;
         }
         if self.wizard.is_some() {
             return Context::Wizard;
@@ -351,47 +543,302 @@ impl App {
     }
 
     pub fn reload_items(&mut self) {
-        match self.client.list_assigned(self.timeframe) {
-            Ok(items) => {
-                self.items = items;
-                if self.items.is_empty() {
-                    self.list_state.select(None);
-                } else {
-                    let sel = self
-                        .list_state
-                        .selected()
-                        .unwrap_or(0)
-                        .min(self.items.len() - 1);
-                    self.list_state.select(Some(sel));
-                }
-                self.rebuild_tree();
-                self.status = format!(
-                    "{} item(s) · timeframe: {}",
-                    self.items.len(),
-                    self.timeframe.label()
-                );
-            }
+        let filter = self.filter();
+        match self.client.list_assigned(&filter) {
+            Ok(items) => self.apply_items(items),
             Err(e) => self.status = format!("error: {e}"),
         }
     }
 
-    /// Periodic refresh from the server (called by the main loop).
+    /// The active server-side filter (timeframe + selected iterations + types).
+    pub fn filter(&self) -> WorkItemFilter {
+        WorkItemFilter {
+            timeframe: self.timeframe,
+            iterations: self.selected_iterations.clone(),
+            item_types: self.item_types.clone(),
+        }
+    }
+
+    /// Short status-bar label summarising the iteration filter.
+    pub fn iteration_filter_label(&self) -> String {
+        match self.selected_iterations.len() {
+            0 => "iter:all".to_string(),
+            1 => {
+                let path = &self.selected_iterations[0];
+                let name = self
+                    .iterations
+                    .iter()
+                    .find(|i| &i.path == path)
+                    .map(|i| i.name.as_str())
+                    .unwrap_or_else(|| path.rsplit(['\\', '/']).next().unwrap_or(path));
+                format!("iter:{name}")
+            }
+            n => format!("iter:{n} sprints"),
+        }
+    }
+
+    /// Short status-bar label summarising the type filter.
+    pub fn type_filter_label(&self) -> String {
+        match self.item_types.len() {
+            0 => "type:all".to_string(),
+            1 => format!("type:{}", self.item_types[0]),
+            n => format!("type:{n} types"),
+        }
+    }
+
+    /// Adopt a freshly fetched item list: clamp selections, rebuild the tree,
+    /// and update the status line. Shared by the sync and async refresh paths.
+    fn apply_items(&mut self, items: Vec<WorkItem>) {
+        self.items = items;
+        if self.items.is_empty() {
+            self.list_state.select(None);
+        } else {
+            let sel = self
+                .list_state
+                .selected()
+                .unwrap_or(0)
+                .min(self.items.len() - 1);
+            self.list_state.select(Some(sel));
+        }
+        self.rebuild_tree();
+        self.status = format!(
+            "{} item(s) · timeframe: {}",
+            self.items.len(),
+            self.timeframe.label()
+        );
+    }
+
+    /// Kick off a non-blocking refresh on a background thread. The UI keeps
+    /// running (showing a spinner) and picks up the result via [`drain_refresh`].
+    /// If a refresh is already running, remembers to fire another when it ends.
+    pub fn request_refresh(&mut self) {
+        if self.loading {
+            self.pending_refresh = true;
+            return;
+        }
+        self.loading = true;
+        self.status = "loading…".into();
+        let client = self.client.clone_box();
+        let tx = self.refresh_tx.clone();
+        let filter = self.filter();
+        let want_iterations = self.iterations.is_empty();
+        let current_id = self.current.as_ref().map(|w| w.id);
+        std::thread::spawn(move || {
+            let items = client.list_assigned(&filter).map_err(|e| e.to_string());
+            let iterations = want_iterations.then(|| client.list_iterations());
+            let current = current_id.map(|id| client.get(id).map_err(|e| e.to_string()));
+            // Also refresh the related items' titles for the relations pane.
+            let mut related = HashMap::new();
+            if let Some(Ok(item)) = &current {
+                let mut ids = Vec::new();
+                if let Some(p) = item.parent {
+                    ids.push(p);
+                }
+                ids.extend(item.children.iter().copied());
+                for id in ids {
+                    if let Ok(rel) = client.get(id) {
+                        related.insert(id, rel.title);
+                    }
+                }
+            }
+            let _ = tx.send(RefreshOutcome {
+                filter,
+                items,
+                iterations,
+                current,
+                related,
+            });
+        });
+    }
+
+    /// Apply any completed background refreshes. Called every loop iteration;
+    /// non-blocking, so it never stalls the UI.
+    pub fn drain_refresh(&mut self) {
+        while let Ok(outcome) = self.refresh_rx.try_recv() {
+            self.loading = false;
+            let RefreshOutcome {
+                filter,
+                items,
+                iterations,
+                current,
+                related,
+            } = outcome;
+            // Store any freshly fetched iterations; on first load default the
+            // filter to the current sprint and re-issue the fetch.
+            if let Some(iters) = iterations {
+                self.iterations = iters;
+                if !self.iterations_initialized {
+                    self.iterations_initialized = true;
+                    if let Some(cur) = self.iterations.iter().find(|i| i.is_current) {
+                        self.selected_iterations = vec![cur.path.clone()];
+                        self.request_refresh();
+                    }
+                }
+            }
+            // On the first async load, default the type filter to User Stories
+            // and Features (kept out of the sync path so tests see all types).
+            if !self.item_types_initialized {
+                self.item_types_initialized = true;
+                self.item_types = crate::api::models::DEFAULT_WORK_ITEM_TYPES
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                self.request_refresh();
+            }
+            // Ignore results for a filter the user has since switched away from.
+            if filter != self.filter() {
+                continue;
+            }
+            match items {
+                Ok(items) => self.apply_items(items),
+                Err(e) => self.status = format!("error: {e}"),
+            }
+            if let Some(Ok(item)) = current {
+                // Only adopt it if the same item is still open. Route through the
+                // live-feed diff so upstream changes get ✓/⚠ markers.
+                if self.current.as_ref().map(|c| c.id) == Some(item.id) {
+                    self.related_titles.extend(related);
+                    self.apply_remote_current(item);
+                }
+            }
+        }
+        // A refresh was requested while one was in flight — run it now.
+        if !self.loading && self.pending_refresh {
+            self.pending_refresh = false;
+            self.request_refresh();
+        }
+    }
+
+    /// Periodic refresh from the server (called by the main loop). Non-blocking.
     pub fn poll(&mut self) {
         if self.last_poll.elapsed() < POLL_INTERVAL {
             return;
         }
         self.last_poll = Instant::now();
-        self.reload_items();
-        if let Some(cur) = &self.current {
-            let id = cur.id;
-            if let Ok(item) = self.client.get(id) {
-                self.current = Some(item);
+        self.request_refresh();
+    }
+
+    /// Live-feed: periodically re-fetch just the open item so we notice a
+    /// teammate's edits without waiting for the full-list poll. Non-blocking.
+    pub fn live_poll(&mut self) {
+        if self.live_inflight || self.last_live.elapsed() < LIVE_INTERVAL {
+            return;
+        }
+        let Some(id) = self.current.as_ref().map(|w| w.id) else {
+            return;
+        };
+        self.last_live = Instant::now();
+        self.live_inflight = true;
+        let client = self.client.clone_box();
+        let tx = self.live_tx.clone();
+        let related_ids = self.related_ids();
+        std::thread::spawn(move || {
+            let item = client.get(id).map_err(|e| e.to_string());
+            let mut related = HashMap::new();
+            for rid in related_ids {
+                if let Ok(rel) = client.get(rid) {
+                    related.insert(rid, rel.title);
+                }
+            }
+            let _ = tx.send(CurrentOutcome { id, item, related });
+        });
+    }
+
+    /// Apply any completed live-feed fetches. Non-blocking; called each loop.
+    pub fn drain_live(&mut self) {
+        while let Ok(outcome) = self.live_rx.try_recv() {
+            self.live_inflight = false;
+            let CurrentOutcome { id, item, related } = outcome;
+            if self.current.as_ref().map(|c| c.id) != Some(id) {
+                continue; // user moved on to another item
+            }
+            if let Ok(item) = item {
+                self.related_titles.extend(related);
+                self.apply_remote_current(item);
             }
         }
     }
 
-    pub fn client_title(&self, id: u32) -> Option<String> {
-        self.client.get(id).ok().map(|w| w.title)
+    /// Adopt a freshly fetched server copy of the open item, diffing it against
+    /// what we had and our pending edits to drive the ⚠/✓ field markers.
+    fn apply_remote_current(&mut self, remote: WorkItem) {
+        let old = self.current.clone();
+        for f in EDITABLE_FIELDS.iter() {
+            let key = f.key;
+            let new_val = item_field_value(&remote, key);
+            let old_val = old
+                .as_ref()
+                .map(|w| item_field_value(w, key))
+                .unwrap_or_default();
+            if new_val == old_val {
+                continue; // no upstream change for this field
+            }
+            // Upstream changed this field. If we have a divergent pending edit,
+            // it's a conflict; otherwise the latest content was simply adopted.
+            match self.pending.iter().find(|p| p.field == key) {
+                Some(p) if p.value != new_val => {
+                    self.field_status.insert(key, FieldStatus::Conflicted);
+                }
+                _ => {
+                    self.field_status.insert(key, FieldStatus::Updated);
+                }
+            }
+        }
+        self.set_current(remote);
+    }
+
+    /// True while a background refresh is running.
+    pub fn is_loading(&self) -> bool {
+        self.loading
+    }
+
+    /// Current frame of the loading spinner (advances with wall-clock time).
+    pub fn spinner_frame(&self) -> char {
+        const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let i = (self.started.elapsed().as_millis() / 90) as usize % FRAMES.len();
+        FRAMES[i]
+    }
+
+    /// Set the open item and refresh the cached titles of its related items.
+    /// Switching to a *different* item drops any pending edits and live markers.
+    fn set_current(&mut self, item: WorkItem) {
+        let changed = self.current.as_ref().map(|c| c.id) != Some(item.id);
+        if changed {
+            self.pending.clear();
+            self.pending_comments.clear();
+            self.field_status.clear();
+            self.resolution = None;
+            self.state_picker = None;
+            self.tags_editor = None;
+            self.last_live = Instant::now();
+        }
+        self.current = Some(item);
+        self.cache_related_titles();
+    }
+
+    /// Fetch (once) the titles of the open item's parent/children into the
+    /// cache. Called only when the open item changes — never per render frame.
+    fn cache_related_titles(&mut self) {
+        self.prune_related_titles();
+        for id in self.related_ids() {
+            if let std::collections::hash_map::Entry::Vacant(slot) =
+                self.related_titles.entry(id)
+                && let Ok(item) = self.client.get(id)
+            {
+                slot.insert(item.title);
+            }
+        }
+    }
+
+    /// Drop cached titles that are no longer related to the open item.
+    fn prune_related_titles(&mut self) {
+        let ids = self.related_ids();
+        self.related_titles.retain(|id, _| ids.contains(id));
+    }
+
+    /// Cached title of a related work item, if known. Cheap; no network.
+    pub fn related_title(&self, id: u32) -> Option<&str> {
+        self.related_titles.get(&id).map(String::as_str)
     }
 
     pub fn related_ids(&self) -> Vec<u32> {
@@ -444,10 +891,64 @@ impl App {
         self.tree.flat.get(self.tree.selected).map(|(id, _)| *id)
     }
 
+    /// The work item the user is currently pointed at, for whichever item view
+    /// is active (tree node, list row, or the open detail item).
+    fn active_item_id(&self) -> Option<u32> {
+        match self.context() {
+            Context::Tree => self.tree_selected_id(),
+            Context::WorkItems => self
+                .list_state
+                .selected()
+                .and_then(|i| self.items.get(i))
+                .map(|w| w.id),
+            Context::Detail => self.current.as_ref().map(|w| w.id),
+            _ => None,
+        }
+    }
+
+    /// Browser URL for a work item in the Azure DevOps web UI. `org_url` may be
+    /// a bare org name or a full URL; the project segment is included when set.
+    fn work_item_web_url(&self, id: u32) -> Option<String> {
+        let org = self.config.org_url.trim().trim_end_matches('/');
+        if org.is_empty() {
+            return None;
+        }
+        let base = if org.starts_with("http://") || org.starts_with("https://") {
+            org.to_string()
+        } else {
+            format!("https://dev.azure.com/{org}")
+        };
+        let project = self.config.project.trim();
+        if project.is_empty() {
+            Some(format!("{base}/_workitems/edit/{id}"))
+        } else {
+            Some(format!(
+                "{base}/{}/_workitems/edit/{id}",
+                project.replace(' ', "%20")
+            ))
+        }
+    }
+
+    /// Open the active work item in the system browser.
+    fn open_in_browser(&mut self) {
+        let Some(id) = self.active_item_id() else {
+            self.status = "no item selected".into();
+            return;
+        };
+        let Some(url) = self.work_item_web_url(id) else {
+            self.status = "set org_url in Config to open items in the browser".into();
+            return;
+        };
+        match open::that(&url) {
+            Ok(()) => self.status = format!("opening #{id} in the browser…"),
+            Err(e) => self.status = format!("could not open browser: {e}"),
+        }
+    }
+
     fn open_id(&mut self, id: u32) {
         match self.client.get(id) {
             Ok(item) => {
-                self.current = Some(item);
+                self.set_current(item);
                 self.detail_focus = DetailFocus::Info;
                 self.detail_selected = 0;
                 self.comment_selected = 0;
@@ -485,13 +986,18 @@ impl App {
             Action::Bottom => self.set_selection(isize::MAX),
             Action::NextFilter => {
                 self.timeframe = self.timeframe.next();
-                self.reload_items();
+                self.request_refresh();
             }
             Action::PrevFilter => {
                 self.timeframe = self.timeframe.prev();
-                self.reload_items();
+                self.request_refresh();
             }
-            Action::Reload => self.reload_items(),
+            Action::Reload => self.request_refresh(),
+            Action::OpenIterationFilter => self.open_iteration_picker(),
+            Action::OpenTypeFilter => self.open_type_picker(),
+            Action::OpenCustomTimeframe => {
+                self.date_range = Some(DateRangeInput::new(self.timeframe));
+            }
             Action::Open => self.open(),
             Action::Back => self.tab = Tab::WorkItems,
             Action::FocusNext => self.detail_focus = self.detail_focus.step(1),
@@ -501,11 +1007,14 @@ impl App {
             Action::Edit => self.request_field_edit("description"),
             Action::EditNotes => self.request_field_edit("notes"),
             Action::AddComment => {
-                if let Some(item) = &self.current {
-                    self.pending_editor = Some(EditorRequest::Comment { id: item.id });
+                if self.current.is_some() {
+                    self.pending_editor = Some(EditorRequest::Comment);
                 }
             }
             Action::SimulateRemote => self.simulate_remote(),
+            Action::DeleteComment => self.request_comment_delete(),
+            Action::Push => self.push_pending(),
+            Action::OpenInBrowser => self.open_in_browser(),
             Action::ResolveMerge => self.resolve_merge(),
             Action::ResolveForce => self.resolve_force(),
             Action::EditField => self.begin_config_edit(),
@@ -659,21 +1168,140 @@ impl App {
         self.info_editor = None;
     }
 
-    /// Current value of an editable field on the open item, for display.
+    /// Display value of an editable field on the open item, including any local
+    /// un-pushed edit (pending overlay).
     pub fn info_field_value(&self, key: &str) -> String {
-        let Some(item) = &self.current else {
-            return String::new();
-        };
-        match key {
-            "title" => item.title.clone(),
-            "state" => item.state.to_string(),
-            "assignee" => item.assigned_to.clone(),
-            "iteration" => item.iteration.clone(),
-            "tags" => item.tags.join(", "),
-            "description" => item.description.clone(),
-            "notes" => item.notes.clone(),
-            _ => String::new(),
+        self.effective_field_value(key)
+    }
+
+    /// The server value of a field on the open item (no pending overlay).
+    pub fn server_field_value(&self, key: &str) -> String {
+        self.current
+            .as_ref()
+            .map(|w| item_field_value(w, key))
+            .unwrap_or_default()
+    }
+
+    /// The value the user currently sees: a pending local edit if present,
+    /// otherwise the server value.
+    pub fn effective_field_value(&self, key: &str) -> String {
+        if let Some(p) = self.pending.iter().find(|p| p.field == key) {
+            return p.value.clone();
         }
+        self.server_field_value(key)
+    }
+
+    /// Canonicalize a field name to its `'static` key from [`EDITABLE_FIELDS`].
+    fn static_field_key(field: &str) -> Option<&'static str> {
+        EDITABLE_FIELDS
+            .iter()
+            .find(|f| f.key == field)
+            .map(|f| f.key)
+    }
+
+    /// Record a local edit without pushing it. Captures the server base (and its
+    /// revision) on the first edit of a field so we can detect divergence later.
+    /// A no-op edit (value equals server) clears any pending edit for the field.
+    pub fn set_pending(&mut self, field: &str, value: String) {
+        let Some(key) = Self::static_field_key(field) else {
+            return;
+        };
+        let Some(item) = &self.current else { return };
+        let base = item_field_value(item, key);
+        let base_rev = item.rev;
+        if value == base {
+            self.pending.retain(|p| p.field != key);
+            self.field_status.remove(key);
+            self.status = format!("{key} unchanged");
+            return;
+        }
+        if let Some(p) = self.pending.iter_mut().find(|p| p.field == key) {
+            p.value = value;
+        } else {
+            self.pending.push(PendingEdit {
+                field: key,
+                base,
+                base_rev,
+                value,
+            });
+        }
+        self.status = format!("{} pending edit(s) — press p to push", self.pending.len());
+    }
+
+    /// Whether the open item has any un-pushed local edits.
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty() || !self.pending_comments.is_empty()
+    }
+
+    /// Number of un-pushed local edits (for the status-bar ● indicator).
+    pub fn pending_count(&self) -> usize {
+        self.pending.len() + self.pending_comments.len()
+    }
+
+    /// Live-feed status marker for a field, if any.
+    pub fn field_status(&self, field: &str) -> Option<FieldStatus> {
+        self.field_status.get(field).copied()
+    }
+
+    /// Whether a field has an un-pushed local edit awaiting push.
+    pub fn field_pending(&self, field: &str) -> bool {
+        self.pending.iter().any(|p| p.field == field)
+    }
+
+    /// Overlay text for an existing comment if it has an un-pushed local edit.
+    pub fn pending_comment_edit(&self, comment_id: u32) -> Option<&str> {
+        self.pending_comments.iter().rev().find_map(|c| match c {
+            PendingComment::Edit { comment_id: cid, text } if *cid == comment_id => {
+                Some(text.as_str())
+            }
+            _ => None,
+        })
+    }
+
+    /// Un-pushed, newly-added comments (author, text) awaiting push.
+    pub fn pending_added_comments(&self) -> Vec<(&str, &str)> {
+        self.pending_comments
+            .iter()
+            .filter_map(|c| match c {
+                PendingComment::Add { author, text } => Some((author.as_str(), text.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether an existing comment is marked for deletion on the next push.
+    pub fn pending_comment_deleted(&self, comment_id: u32) -> bool {
+        self.pending_comments
+            .iter()
+            .any(|c| matches!(c, PendingComment::Delete { comment_id: cid } if *cid == comment_id))
+    }
+
+    /// Mark the selected comment for deletion (deferred until push). Toggles off
+    /// if it was already pending deletion.
+    pub fn request_comment_delete(&mut self) {
+        if self.detail_focus != DetailFocus::Comments {
+            return;
+        }
+        let Some(item) = &self.current else { return };
+        let Some(c) = item.comments.get(self.comment_selected) else {
+            return;
+        };
+        let comment_id = c.id;
+        if self.pending_comment_deleted(comment_id) {
+            self.pending_comments.retain(
+                |pc| !matches!(pc, PendingComment::Delete { comment_id: cid } if *cid == comment_id),
+            );
+            self.status = "deletion cancelled".into();
+            return;
+        }
+        // Drop any pending edit on this comment; a delete supersedes it.
+        self.pending_comments.retain(
+            |pc| !matches!(pc, PendingComment::Edit { comment_id: cid, .. } if *cid == comment_id),
+        );
+        self.pending_comments
+            .push(PendingComment::Delete { comment_id });
+        self.status =
+            format!("{} pending change(s) — press p to push", self.pending_count());
     }
 
     pub fn info_nav(&mut self, delta: isize) {
@@ -687,22 +1315,53 @@ impl App {
     pub fn info_activate(&mut self) {
         let Some(ed) = &self.info_editor else { return };
         let field = &EDITABLE_FIELDS[ed.selected];
+        // A field flagged as conflicted by the live-feed opens the resolution
+        // menu instead of letting the user blindly edit over a divergence.
+        if self.field_status.get(field.key) == Some(&FieldStatus::Conflicted) {
+            self.open_resolution_for(field.key);
+            return;
+        }
         match field.kind {
             FieldKind::Line => {
-                let value = self.info_field_value(field.key);
+                let value = self.effective_field_value(field.key);
                 if let Some(ed) = &mut self.info_editor {
                     ed.editing = Some(TextInput::new(&value));
                 }
             }
             FieldKind::State => {
-                if let Some(item) = &self.current {
-                    let id = item.id;
-                    let next = item.state.next();
-                    let _ = self.client.update_field(id, "state", next.label());
-                    self.refresh_current();
-                    self.reload_items();
-                    self.status = format!("#{id} state → {}", next.label());
+                // Prefer a picker over the backend-supplied valid states; fall
+                // back to cycling the canonical enum when none are available.
+                let states: Vec<String> = self
+                    .current
+                    .as_ref()
+                    .map(|w| w.available_states.clone())
+                    .unwrap_or_default();
+                if states.is_empty() {
+                    if let Some(item) = &self.current {
+                        let current = crate::api::models::WorkItemState::from_label(
+                            &self.effective_field_value("state"),
+                        )
+                        .unwrap_or(item.state);
+                        let next = current.next();
+                        self.set_pending("state", next.label().to_string());
+                    }
+                } else {
+                    let mut picker = Picker::new(states.clone());
+                    let cur = self.effective_field_value("state");
+                    if let Some(idx) = states.iter().position(|s| *s == cur) {
+                        picker.selected = idx;
+                    }
+                    self.state_picker = Some(picker);
                 }
+            }
+            FieldKind::Tags => {
+                let tags = self
+                    .current
+                    .as_ref()
+                    .map(|w| w.tags.clone())
+                    .unwrap_or_default();
+                let known = self.client.list_tags();
+                self.tags_editor = Some(TagsEditor::new(tags, known));
             }
             FieldKind::Multiline => {
                 // Editor handoff closes the modal; conflict-aware via base_rev.
@@ -718,16 +1377,10 @@ impl App {
         let key = EDITABLE_FIELDS[ed.selected].key;
         let Some(input) = &ed.editing else { return };
         let value = input.value();
-        let id = ed.id;
-        match self.client.update_field(id, key, &value) {
-            Ok(()) => self.status = format!("{key} updated on #{id}"),
-            Err(e) => self.status = format!("update failed: {e}"),
-        }
+        self.set_pending(key, value);
         if let Some(ed) = &mut self.info_editor {
             ed.editing = None;
         }
-        self.refresh_current();
-        self.reload_items();
     }
 
     pub fn info_cancel_edit(&mut self) {
@@ -736,30 +1389,116 @@ impl App {
         }
     }
 
+    /// Apply the highlighted state from the floating state picker.
+    pub fn state_picker_select(&mut self) {
+        if let Some(p) = &self.state_picker
+            && let Some(choice) = p.current()
+        {
+            self.set_pending("state", choice);
+        }
+        self.state_picker = None;
+    }
+
+    pub fn state_picker_cancel(&mut self) {
+        self.state_picker = None;
+    }
+
+    /// Commit the tags editor's working set as a pending `tags` edit.
+    pub fn tags_editor_commit(&mut self) {
+        if let Some(t) = &self.tags_editor {
+            let value = t.value();
+            self.set_pending("tags", value);
+        }
+        self.tags_editor = None;
+    }
+
+    pub fn tags_editor_cancel(&mut self) {
+        self.tags_editor = None;
+    }
+
+    /// Open the iteration (sprint) multi-select filter.
+    pub fn open_iteration_picker(&mut self) {
+        self.iteration_picker = Some(IterationPicker::new(
+            self.iterations.clone(),
+            self.selected_iterations.clone(),
+        ));
+    }
+
+    pub fn iteration_picker_commit(&mut self) {
+        if let Some(p) = &self.iteration_picker {
+            self.selected_iterations = p.value();
+        }
+        self.iteration_picker = None;
+        self.request_refresh();
+    }
+
+    pub fn iteration_picker_cancel(&mut self) {
+        self.iteration_picker = None;
+    }
+
+    pub fn open_type_picker(&mut self) {
+        let options = crate::api::models::WORK_ITEM_TYPES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        self.type_picker = Some(TypeFilter::new(options, self.item_types.clone()));
+    }
+
+    pub fn type_picker_commit(&mut self) {
+        if let Some(p) = &self.type_picker {
+            self.item_types = p.value();
+        }
+        self.type_picker = None;
+        // The user has made an explicit choice; don't let the first async load
+        // overwrite it with the default.
+        self.item_types_initialized = true;
+        self.request_refresh();
+    }
+
+    pub fn type_picker_cancel(&mut self) {
+        self.type_picker = None;
+    }
+
+    pub fn date_range_commit(&mut self) {
+        if let Some(d) = &self.date_range
+            && let Some(tf) = d.value()
+        {
+            self.timeframe = tf;
+            self.date_range = None;
+            self.request_refresh();
+            return;
+        }
+        self.date_range = None;
+    }
+
+    pub fn date_range_cancel(&mut self) {
+        self.date_range = None;
+    }
+
     fn request_comment_edit(&mut self) {
         if let Some(item) = &self.current
             && let Some(c) = item.comments.get(self.comment_selected) {
+                // Seed with any un-pushed local edit so further edits stack.
+                let initial = self
+                    .pending_comment_edit(c.id)
+                    .unwrap_or(&c.text)
+                    .to_string();
                 self.pending_editor = Some(EditorRequest::EditComment {
-                    id: item.id,
                     comment_id: c.id,
-                    initial: c.text.clone(),
+                    initial,
                 });
             }
     }
 
     fn request_field_edit(&mut self, field: &'static str) {
-        if let Some(item) = &self.current {
-            let initial = match field {
-                "title" => item.title.clone(),
-                "notes" => item.notes.clone(),
-                _ => item.description.clone(),
-            };
-            self.pending_editor = Some(EditorRequest::Field {
-                id: item.id,
-                field,
-                initial,
-                base_rev: item.rev,
-            });
+        if self.current.is_some() {
+            // A live-feed conflict on this field routes to the resolution menu.
+            if self.field_status.get(field) == Some(&FieldStatus::Conflicted) {
+                self.open_resolution_for(field);
+                return;
+            }
+            let initial = self.effective_field_value(field);
+            self.pending_editor = Some(EditorRequest::Field { field, initial });
         }
     }
 
@@ -767,70 +1506,53 @@ impl App {
     pub fn apply_editor_result(&mut self, req: EditorRequest, text: String) {
         let text = text.trim_end().to_string();
         match req {
-            EditorRequest::Field {
-                id,
-                field,
-                initial,
-                base_rev,
-            } => {
-                // Conflict if the server moved on AND the remote value differs.
-                let remote_item = self.client.get(id).ok();
-                let server_rev = remote_item.as_ref().map(|w| w.rev).unwrap_or(base_rev);
-                let remote = remote_item
-                    .map(|w| field_value(&w, field))
-                    .unwrap_or_default();
-                if server_rev != base_rev && remote != initial && remote != text {
-                    self.conflict = Some(Conflict {
-                        id,
-                        field,
-                        base: initial,
-                        local: text,
-                        remote,
-                    });
-                    self.status =
-                        format!("conflict on {field} of #{id}: m to merge, f to force-push");
-                } else {
-                    match self.client.update_field(id, field, &text) {
-                        Ok(()) => self.status = format!("updated {field} on #{id} (local mock)"),
-                        Err(e) => self.status = format!("update failed: {e}"),
-                    }
-                }
+            EditorRequest::Field { field, .. } => {
+                // Deferred: record locally, push later with `p`.
+                self.set_pending(field, text);
             }
             EditorRequest::Merge { id, field } => {
-                match self.client.update_field(id, field, &text) {
-                    Ok(()) => self.status = format!("merged {field} on #{id}"),
-                    Err(e) => self.status = format!("merge failed: {e}"),
+                // The merged text becomes the new local value; record it as a
+                // pending edit rebased onto the latest server revision, then drop
+                // this field from the active resolution.
+                self.set_pending(field, text);
+                if let Some(p) = self.pending.iter_mut().find(|p| p.field == field)
+                    && let Ok(remote) = self.client.get(id)
+                {
+                    p.base = item_field_value(&remote, field);
+                    p.base_rev = remote.rev;
                 }
-                self.conflict = None;
+                self.field_status.remove(field);
+                self.resolve_finish_field(field);
+                self.refresh_current();
+                self.reload_items();
             }
-            EditorRequest::Comment { id } => {
+            EditorRequest::Comment => {
                 if text.is_empty() {
                     self.status = "empty comment discarded".into();
                 } else {
+                    // Deferred: held locally until the user pushes.
                     let author = self.auth.account().unwrap_or("you@example.com").to_string();
-                    match self.client.add_comment(id, &author, &text) {
-                        Ok(()) => self.status = format!("comment added to #{id} (local mock)"),
-                        Err(e) => self.status = format!("comment failed: {e}"),
-                    }
+                    self.pending_comments
+                        .push(PendingComment::Add { author, text });
+                    self.status =
+                        format!("{} pending change(s) — press p to push", self.pending_count());
                 }
             }
-            // Last-write-wins: comment edits skip conflict detection by design.
-            EditorRequest::EditComment { id, comment_id, .. } => {
-                match self.client.update_comment(id, comment_id, &text) {
-                    Ok(()) => self.status = format!("comment {comment_id} edited on #{id}"),
-                    Err(e) => self.status = format!("comment edit failed: {e}"),
-                }
+            // Comment edits are deferred too (last-write-wins on push).
+            EditorRequest::EditComment { comment_id, .. } => {
+                self.pending_comments
+                    .push(PendingComment::Edit { comment_id, text });
+                self.status =
+                    format!("{} pending change(s) — press p to push", self.pending_count());
             }
         }
-        self.refresh_current();
-        self.reload_items();
     }
 
     fn refresh_current(&mut self) {
         if let Some(cur) = &self.current {
             let id = cur.id;
             if let Ok(item) = self.client.get(id) {
-                self.current = Some(item);
+                self.set_current(item);
             }
         }
     }
@@ -841,8 +1563,13 @@ impl App {
             let id = cur.id;
             match self.client.simulate_remote_edit(id) {
                 Ok(()) => {
-                    self.status = format!("simulated a teammate editing #{id} — now try editing it");
-                    self.refresh_current();
+                    self.status =
+                        format!("simulated a teammate editing #{id} — watch for ⚠/✓ markers");
+                    // Route through the live-feed diff so the changed field gets
+                    // a ⚠ (if it clashes with a pending edit) or ✓ marker.
+                    if let Ok(item) = self.client.get(id) {
+                        self.apply_remote_current(item);
+                    }
                     self.reload_items();
                 }
                 Err(e) => self.status = format!("{e}"),
@@ -850,30 +1577,188 @@ impl App {
         }
     }
 
+    // --- manual push & conflict resolution ---
+
+    /// Push all pending local edits in the background so the UI stays responsive.
+    /// A worker re-fetches the server copy, checks for divergence, and either
+    /// uploads everything or reports conflicts (picked up by [`drain_push`]).
+    pub fn push_pending(&mut self) {
+        if self.pushing {
+            self.status = "a push is already in progress…".into();
+            return;
+        }
+        if !self.has_pending() {
+            self.status = "nothing to push".into();
+            return;
+        }
+        self.spawn_push(false);
+    }
+
+    /// Take the pending edits as an in-flight snapshot and upload them on a
+    /// worker thread. `force` skips the divergence pre-check (used by the
+    /// resolution menu's force-push).
+    fn spawn_push(&mut self, force: bool) {
+        let Some(cur) = &self.current else { return };
+        let id = cur.id;
+        // Take the edits out as an in-flight snapshot; new edits made while the
+        // push runs accumulate fresh and are pushed on the next `p`.
+        let pending = std::mem::take(&mut self.pending);
+        let comments = std::mem::take(&mut self.pending_comments);
+        self.pushing = true;
+        self.status = "pushing…".into();
+        let client = self.client.clone_box();
+        let tx = self.push_tx.clone();
+        std::thread::spawn(move || {
+            let outcome = run_push(client, id, pending, comments, force);
+            let _ = tx.send(outcome);
+        });
+    }
+
+    /// Apply any completed background push. Non-blocking; called each loop.
+    pub fn drain_push(&mut self) {
+        while let Ok(outcome) = self.push_rx.try_recv() {
+            self.pushing = false;
+            match outcome {
+                PushOutcome::Conflicts {
+                    id,
+                    conflicts,
+                    pending,
+                    comments,
+                } => {
+                    // Only meaningful if the same item is still open; otherwise
+                    // the user moved on and we drop the stale edits.
+                    if self.current.as_ref().map(|c| c.id) != Some(id) {
+                        self.status =
+                            format!("push for #{id} found conflicts but you've moved on");
+                        continue;
+                    }
+                    self.pending = pending;
+                    self.pending_comments = comments;
+                    let n = conflicts.len();
+                    self.resolution = Some(Resolution {
+                        id,
+                        conflicts,
+                        selected: 0,
+                    });
+                    self.status = format!(
+                        "{n} conflicting field(s): j/k select, m merge, f force, Esc cancel"
+                    );
+                }
+                PushOutcome::Done { id, total, failed } => {
+                    self.field_status.clear();
+                    // Refresh in the background so this stays non-blocking.
+                    self.request_refresh();
+                    self.status = if failed == 0 {
+                        format!("pushed {total} change(s) to #{id}")
+                    } else {
+                        format!("pushed {} change(s); {failed} failed", total - failed)
+                    };
+                }
+                PushOutcome::Error {
+                    message,
+                    pending,
+                    comments,
+                } => {
+                    // Restore the edits so nothing is lost.
+                    if self.pending.is_empty() {
+                        self.pending = pending;
+                    }
+                    if self.pending_comments.is_empty() {
+                        self.pending_comments = comments;
+                    }
+                    self.status = format!("push failed: {message}");
+                }
+            }
+        }
+    }
+
+    /// True while a manual push is uploading in the background.
+    pub fn is_pushing(&self) -> bool {
+        self.pushing
+    }
+
+    /// Open the resolution menu pre-scoped to a single field (used when the user
+    /// tries to edit a field the live-feed has flagged as conflicted).
+    fn open_resolution_for(&mut self, field: &'static str) {
+        let Some(cur) = &self.current else { return };
+        let id = cur.id;
+        let remote = item_field_value(cur, field);
+        let (base, local) = self
+            .pending
+            .iter()
+            .find(|p| p.field == field)
+            .map(|p| (p.base.clone(), p.value.clone()))
+            .unwrap_or_else(|| (remote.clone(), remote.clone()));
+        self.resolution = Some(Resolution {
+            id,
+            conflicts: vec![FieldConflict {
+                field,
+                base,
+                local,
+                remote,
+            }],
+            selected: 0,
+        });
+        self.status =
+            format!("conflict on {field}: m to merge, f to force-push, Esc to cancel");
+    }
+
+    /// Move the selection within the resolution menu.
+    pub fn resolution_nav(&mut self, delta: isize) {
+        if let Some(r) = &mut self.resolution
+            && !r.conflicts.is_empty()
+        {
+            let n = r.conflicts.len() as isize;
+            r.selected = (r.selected as isize + delta).rem_euclid(n) as usize;
+        }
+    }
+
+    pub fn resolution_cancel(&mut self) {
+        self.resolution = None;
+        self.status = "resolution cancelled (changes still pending)".into();
+    }
+
+    /// Remove a resolved field from the active menu; close it when none remain.
+    fn resolve_finish_field(&mut self, field: &str) {
+        if let Some(r) = &mut self.resolution {
+            r.conflicts.retain(|c| c.field != field);
+            r.selected = 0;
+            if r.conflicts.is_empty() {
+                self.resolution = None;
+            }
+        }
+    }
+
+    /// Merge the selected conflicting field by hand in `$EDITOR` (conflict markers).
     fn resolve_merge(&mut self) {
-        if let Some(c) = &self.conflict {
+        if let Some(r) = &self.resolution
+            && let Some(c) = r.conflicts.get(r.selected)
+        {
             let body = format!(
                 "<<<<<<< local (your changes)\n{}\n||||||| base (common ancestor)\n{}\n=======\n{}\n>>>>>>> remote (current server)\n",
                 c.local, c.base, c.remote
             );
             self.pending_editor = Some(EditorRequest::Merge {
-                id: c.id,
+                id: r.id,
                 field: c.field,
             });
-            // Stash the marker text to seed the editor via the Merge initial.
             self.merge_seed = Some(body);
         }
     }
 
+    /// Force-push every locally-pending field, discarding remote changes.
     fn resolve_force(&mut self) {
-        if let Some(c) = self.conflict.take() {
-            match self.client.update_field(c.id, c.field, &c.local) {
-                Ok(()) => self.status = format!("force-pushed {} on #{}", c.field, c.id),
-                Err(e) => self.status = format!("force-push failed: {e}"),
-            }
-            self.refresh_current();
-            self.reload_items();
+        self.resolution = None;
+        if self.pushing {
+            self.status = "a push is already in progress…".into();
+            return;
         }
+        if !self.has_pending() {
+            self.status = "nothing to push".into();
+            return;
+        }
+        self.spawn_push(true);
+        self.status = "force-pushing local changes…".into();
     }
 
     fn begin_config_edit(&mut self) {
@@ -944,6 +1829,8 @@ impl App {
                 self.config.org_url = format!("https://dev.azure.com/{org}");
                 self.config.project = project;
                 self.do_login();
+                self.client
+                    .reconfigure(&self.config.org_url, &self.config.project);
                 let _ = self.config.save();
                 self.wizard = None;
                 self.tab = Tab::Tree;
@@ -961,12 +1848,85 @@ impl App {
     }
 }
 
-fn field_value(w: &WorkItem, field: &str) -> String {
+/// Read any editable field of a work item as a display string. Single source of
+/// truth for conflict detection and pending-edit comparisons.
+pub fn item_field_value(w: &WorkItem, field: &str) -> String {
     match field {
-        "notes" => w.notes.clone(),
         "title" => w.title.clone(),
+        "state" => w.state_name.clone(),
+        "assignee" => w.assigned_to.clone(),
+        "iteration" => w.iteration.clone(),
+        "tags" => w.tags.join(", "),
+        "notes" => w.notes.clone(),
         _ => w.description.clone(),
     }
+}
+
+/// Worker body for a background push. Re-fetches the open item, checks each
+/// pending field for genuine divergence (unless `force`), then uploads all
+/// pending field + comment changes. Runs entirely off the UI thread.
+fn run_push(
+    mut client: Box<dyn WorkItemClient + Send + Sync>,
+    id: u32,
+    pending: Vec<PendingEdit>,
+    comments: Vec<PendingComment>,
+    force: bool,
+) -> PushOutcome {
+    if !force {
+        let remote = match client.get(id) {
+            Ok(item) => item,
+            Err(e) => {
+                return PushOutcome::Error {
+                    message: e.to_string(),
+                    pending,
+                    comments,
+                };
+            }
+        };
+        let mut conflicts = Vec::new();
+        for p in &pending {
+            let remote_val = item_field_value(&remote, p.field);
+            // Genuine divergence: server moved on, and its value differs from
+            // both our base and our local edit.
+            if remote.rev != p.base_rev && remote_val != p.base && remote_val != p.value {
+                conflicts.push(FieldConflict {
+                    field: p.field,
+                    base: p.base.clone(),
+                    local: p.value.clone(),
+                    remote: remote_val,
+                });
+            }
+        }
+        if !conflicts.is_empty() {
+            return PushOutcome::Conflicts {
+                id,
+                conflicts,
+                pending,
+                comments,
+            };
+        }
+    }
+
+    let total = pending.len() + comments.len();
+    let mut failed = 0;
+    for p in pending {
+        if client.update_field(id, p.field, &p.value).is_err() {
+            failed += 1;
+        }
+    }
+    for c in comments {
+        let ok = match c {
+            PendingComment::Add { author, text } => client.add_comment(id, &author, &text).is_ok(),
+            PendingComment::Edit { comment_id, text } => {
+                client.update_comment(id, comment_id, &text).is_ok()
+            }
+            PendingComment::Delete { comment_id } => client.delete_comment(id, comment_id).is_ok(),
+        };
+        if !ok {
+            failed += 1;
+        }
+    }
+    PushOutcome::Done { id, total, failed }
 }
 
 fn flatten(
@@ -1005,6 +1965,47 @@ mod tests {
         app
     }
 
+    /// Drive background push + refresh workers to completion (tests only).
+    impl App {
+        fn settle(&mut self) {
+            for _ in 0..3000 {
+                self.drain_push();
+                self.drain_refresh();
+                if !self.pushing && !self.loading {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    #[test]
+    fn async_refresh_loads_without_blocking() {
+        let cfg = Config {
+            org_url: "https://dev.azure.com/acme".into(),
+            project: "Widgets".into(),
+            ..Default::default()
+        };
+        let mut app = App::new(cfg);
+        app.timeframe = Timeframe::All;
+        app.items.clear();
+
+        // Kick off a background refresh; the call returns immediately.
+        app.request_refresh();
+        assert!(app.is_loading(), "refresh should mark the app as loading");
+
+        // Wait for the worker thread to deliver results, then apply them.
+        for _ in 0..100 {
+            app.drain_refresh();
+            if !app.is_loading() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!app.is_loading(), "loading flag should clear once results arrive");
+        assert!(!app.items.is_empty(), "items should be populated after refresh");
+    }
+
     #[test]
     fn empty_config_starts_fzf_wizard() {
         let app = App::new(Config::default());
@@ -1035,40 +2036,76 @@ mod tests {
         app.apply(Action::Open);
         assert_eq!(app.tab, Tab::Detail);
         assert_eq!(app.current.as_ref().unwrap().id, 1002);
+        // Related titles are cached on open so the relations pane never queries
+        // the backend while navigating panes.
+        for rel in app.related_ids() {
+            assert!(app.related_title(rel).is_some(), "title for #{rel} should be cached");
+        }
     }
 
     #[test]
     fn notes_edit_applies() {
         let mut app = ready_app();
         app.open_id(1001);
-        let base_rev = app.current.as_ref().unwrap().rev;
+        // Editing records a pending change; the server is untouched until push.
         app.apply_editor_result(
-            EditorRequest::Field { id: 1001, field: "notes", initial: "x".into(), base_rev },
+            EditorRequest::Field { field: "notes", initial: "x".into() },
             "new notes".into(),
         );
+        assert!(app.has_pending());
+        assert_eq!(app.effective_field_value("notes"), "new notes");
+        // Pushing uploads it and clears pending.
+        app.push_pending();
+        app.settle();
+        assert!(!app.has_pending());
         assert_eq!(app.current.as_ref().unwrap().notes, "new notes");
+    }
+
+    #[test]
+    fn work_item_web_url_builds_from_org_and_project() {
+        let mut app = ready_app();
+        // Bare org name + project with a space → full dev.azure.com URL.
+        app.config.org_url = "contoso".into();
+        app.config.project = "My Project".into();
+        assert_eq!(
+            app.work_item_web_url(1002).unwrap(),
+            "https://dev.azure.com/contoso/My%20Project/_workitems/edit/1002"
+        );
+        // A full URL is used as-is (trailing slash trimmed).
+        app.config.org_url = "https://dev.azure.com/contoso/".into();
+        app.config.project = "Widgets".into();
+        assert_eq!(
+            app.work_item_web_url(7).unwrap(),
+            "https://dev.azure.com/contoso/Widgets/_workitems/edit/7"
+        );
+        // No org configured → no URL.
+        app.config.org_url = "".into();
+        assert!(app.work_item_web_url(1).is_none());
     }
 
     #[test]
     fn remote_change_triggers_conflict_then_force_resolves() {
         let mut app = ready_app();
         app.open_id(1002);
-        let base_rev = app.current.as_ref().unwrap().rev;
-        // Teammate edits the same item after we started editing.
-        app.client.simulate_remote_edit(1002).unwrap();
+        // We make a local edit (deferred, not yet pushed).
         app.apply_editor_result(
             EditorRequest::Field {
-                id: 1002,
                 field: "description",
                 initial: "my original".into(),
-                base_rev,
             },
             "my edit".into(),
         );
-        assert!(app.conflict.is_some(), "expected a conflict");
-        // Force-push keeps our local value.
+        // Teammate edits the same field after we started editing.
+        app.client.simulate_remote_edit(1002).unwrap();
+        // Pushing detects the divergence and opens the resolution menu.
+        app.push_pending();
+        app.settle();
+        assert!(app.resolution.is_some(), "expected a conflict resolution menu");
+        // Force-push keeps our local value and closes the menu.
         app.apply(Action::ResolveForce);
-        assert!(app.conflict.is_none());
+        app.settle();
+        assert!(app.resolution.is_none());
+        assert!(!app.has_pending());
         assert_eq!(app.current.as_ref().unwrap().description, "my edit");
     }
 
@@ -1081,13 +2118,65 @@ mod tests {
         let comment_id = app.current.as_ref().unwrap().comments[0].id;
         app.apply_editor_result(
             EditorRequest::EditComment {
-                id: 1001,
                 comment_id,
                 initial: "old".into(),
             },
             "edited text".into(),
         );
+        // Deferred: the edit overlays locally but the server is untouched until push.
+        assert_eq!(app.pending_comment_edit(comment_id), Some("edited text"));
+        assert!(app.has_pending());
+        app.push_pending();
+        app.settle();
         assert_eq!(app.current.as_ref().unwrap().comments[0].text, "edited text");
+    }
+
+    #[test]
+    fn add_comment_is_deferred_until_push() {
+        let mut app = ready_app();
+        app.open_id(1002);
+        let before = app.current.as_ref().unwrap().comments.len();
+        app.apply_editor_result(EditorRequest::Comment, "a brand new comment".into());
+        // Held locally; server comment count unchanged until push.
+        assert!(app.has_pending());
+        assert_eq!(app.current.as_ref().unwrap().comments.len(), before);
+        assert_eq!(app.pending_added_comments(), vec![("you@example.com", "a brand new comment")]);
+        app.push_pending();
+        app.settle();
+        assert!(!app.has_pending());
+        assert_eq!(app.current.as_ref().unwrap().comments.len(), before + 1);
+    }
+
+    #[test]
+    fn field_pending_tracks_unpushed_edit() {
+        let mut app = ready_app();
+        app.open_id(1002);
+        assert!(!app.field_pending("title"));
+        app.set_pending("title", "edited title".into());
+        // The edited field is flagged as pending (drives its yellow border) until
+        // pushed; an untouched field is not.
+        assert!(app.field_pending("title"));
+        assert!(!app.field_pending("description"));
+        app.push_pending();
+        app.settle();
+        assert!(!app.field_pending("title"));
+    }
+
+    #[test]
+    fn push_runs_in_background_without_blocking() {
+        let mut app = ready_app();
+        app.open_id(1002);
+        app.set_pending("title", "async title".into());
+        app.push_pending();
+        // The push is spawned on a worker; the flag is set immediately so the
+        // status bar can show the spinner while the UI keeps responding.
+        assert!(app.is_pushing());
+        app.settle();
+        // Once the worker finishes the flag clears and the edit is persisted on
+        // the shared server copy.
+        assert!(!app.is_pushing());
+        assert!(!app.field_pending("title"));
+        assert_eq!(app.client.get(1002).unwrap().title, "async title");
     }
 
     #[test]
@@ -1106,6 +2195,58 @@ mod tests {
         assert_eq!(app.detail_focus, start);
     }
 
+    #[test]
+    fn delete_comment_is_deferred_until_push() {
+        let mut app = ready_app();
+        // #1003 has one canned comment.
+        app.open_id(1003);
+        app.detail_focus = DetailFocus::Comments;
+        app.comment_selected = 0;
+        let cid = app.current.as_ref().unwrap().comments[0].id;
+        let before = app.current.as_ref().unwrap().comments.len();
+        app.request_comment_delete();
+        // Marked locally; the server copy is untouched until push.
+        assert!(app.pending_comment_deleted(cid));
+        assert_eq!(app.current.as_ref().unwrap().comments.len(), before);
+        app.push_pending();
+        app.settle();
+        assert!(!app.pending_comment_deleted(cid));
+        assert_eq!(app.current.as_ref().unwrap().comments.len(), before - 1);
+    }
+
+    #[test]
+    fn delete_comment_toggles_off() {
+        let mut app = ready_app();
+        app.open_id(1003);
+        app.detail_focus = DetailFocus::Comments;
+        app.comment_selected = 0;
+        let cid = app.current.as_ref().unwrap().comments[0].id;
+        app.request_comment_delete();
+        assert!(app.pending_comment_deleted(cid));
+        // Pressing delete again cancels the pending deletion.
+        app.request_comment_delete();
+        assert!(!app.pending_comment_deleted(cid));
+        assert!(!app.has_pending());
+    }
+
+    #[test]
+    fn tags_editor_commits_as_pending() {
+        let mut app = ready_app();
+        app.open_id(1002); // has tag "read"
+        app.open_info_editor();
+        app.info_editor.as_mut().unwrap().selected = field_index("tags");
+        app.info_activate();
+        assert!(app.tags_editor.is_some());
+        // Add a brand-new tag and commit.
+        app.tags_editor.as_mut().unwrap().selected.push("urgent".into());
+        app.tags_editor_commit();
+        assert!(app.field_pending("tags"));
+        assert!(app.effective_field_value("tags").contains("urgent"));
+        app.push_pending();
+        app.settle();
+        assert!(app.current.as_ref().unwrap().tags.contains(&"urgent".to_string()));
+    }
+
     fn field_index(key: &str) -> usize {
         EDITABLE_FIELDS.iter().position(|f| f.key == key).unwrap()
     }
@@ -1121,18 +2262,38 @@ mod tests {
         app.info_activate(); // begin inline edit
         app.info_editor.as_mut().unwrap().editing = Some(TextInput::new("Renamed item"));
         app.info_commit_edit();
+        // Deferred: the edit is pending and visible via the effective value, but
+        // the server copy only changes once pushed.
+        assert_eq!(app.effective_field_value("title"), "Renamed item");
+        assert!(app.has_pending());
+        app.push_pending();
+        app.settle();
         assert_eq!(app.current.as_ref().unwrap().title, "Renamed item");
     }
 
     #[test]
-    fn info_editor_cycles_state() {
+    fn info_editor_state_picker_sets_state() {
         let mut app = ready_app();
         app.open_id(1002);
-        let before = app.current.as_ref().unwrap().state;
         app.open_info_editor();
         app.info_editor.as_mut().unwrap().selected = field_index("state");
         app.info_activate();
-        assert_eq!(app.current.as_ref().unwrap().state, before.next());
+        // The backend supplies valid states, so a picker opens instead of an
+        // in-place cycle.
+        assert!(app.state_picker.is_some());
+        let picker = app.state_picker.as_mut().unwrap();
+        let idx = picker
+            .options
+            .iter()
+            .position(|s| s == "Resolved")
+            .unwrap();
+        picker.selected = idx;
+        app.state_picker_select();
+        // Deferred: pending until pushed.
+        assert_eq!(app.effective_field_value("state"), "Resolved");
+        app.push_pending();
+        app.settle();
+        assert_eq!(app.current.as_ref().unwrap().state_name, "Resolved");
     }
 
     #[test]
@@ -1148,6 +2309,34 @@ mod tests {
     }
 
     #[test]
+    fn live_feed_marks_upstream_update_without_pending() {
+        let mut app = ready_app();
+        app.open_id(1002);
+        // No local edits; a teammate changes the item upstream.
+        app.client.simulate_remote_edit(1002).unwrap();
+        let remote = app.client.get(1002).unwrap();
+        app.apply_remote_current(remote);
+        // The changed field is flagged as cleanly updated (✓), not conflicted.
+        assert_eq!(app.field_status("description"), Some(FieldStatus::Updated));
+    }
+
+    #[test]
+    fn live_feed_flags_conflict_when_pending_diverges() {
+        let mut app = ready_app();
+        app.open_id(1002);
+        // We have an un-pushed local edit on description.
+        app.set_pending("description", "my local edit".into());
+        // Meanwhile a teammate changes the same field upstream.
+        app.client.simulate_remote_edit(1002).unwrap();
+        let remote = app.client.get(1002).unwrap();
+        app.apply_remote_current(remote);
+        // The field is flagged as conflicted (⚠); editing it opens the menu.
+        assert_eq!(app.field_status("description"), Some(FieldStatus::Conflicted));
+        app.request_field_edit("description");
+        assert!(app.resolution.is_some());
+    }
+
+    #[test]
     fn session_round_trips_view_state() {
         use crate::session::SessionState;
         let mut app = ready_app();
@@ -1156,6 +2345,8 @@ mod tests {
         let saved = SessionState {
             tab: app.tab,
             timeframe: app.timeframe,
+            selected_iterations: app.selected_iterations.clone(),
+            item_types: app.item_types.clone(),
             current_id: app.current.as_ref().map(|w| w.id),
             tree_expanded: app.tree.expanded.iter().copied().collect(),
             tree_selected: app.tree.selected,
@@ -1181,5 +2372,167 @@ mod tests {
         app.commit_config_edit();
         assert_eq!(app.config.project, "NewProject");
         assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn iteration_filter_restricts_list_to_selected_sprint() {
+        let mut app = ready_app();
+        // Mimic the real flow where iterations are already loaded.
+        app.iterations = app.client.list_iterations();
+        app.iterations_initialized = true;
+        // Mock items all live in "Sprint 24"; selecting "Sprint 25" hides them.
+        let sprint25 = app
+            .iterations
+            .iter()
+            .find(|i| i.name == "Sprint 25")
+            .unwrap()
+            .clone();
+        app.open_iteration_picker();
+        app.iteration_picker.as_mut().unwrap().selected = vec![sprint25.path.clone()];
+        app.iteration_picker_commit();
+        app.settle();
+        assert!(app.items.is_empty());
+        // Switching to the current sprint brings them back.
+        let current = app
+            .iterations
+            .iter()
+            .find(|i| i.is_current)
+            .unwrap()
+            .clone();
+        app.open_iteration_picker();
+        app.iteration_picker.as_mut().unwrap().selected = vec![current.path.clone()];
+        app.iteration_picker_commit();
+        app.settle();
+        assert!(!app.items.is_empty());
+    }
+
+    #[test]
+    fn iteration_picker_routes_through_context() {
+        let mut app = ready_app();
+        app.open_iteration_picker();
+        assert_eq!(app.context(), Context::IterationFilter);
+        app.iteration_picker_cancel();
+        assert_ne!(app.context(), Context::IterationFilter);
+    }
+
+    #[test]
+    fn type_filter_restricts_list_to_selected_types() {
+        let mut app = ready_app();
+        // Default (sync) path shows all types, including the Epic (1001).
+        assert!(app.items.iter().any(|w| w.item_type == "Epic"));
+        // Selecting only "Task" hides everything that isn't a Task.
+        app.open_type_picker();
+        app.type_picker.as_mut().unwrap().selected = vec!["Task".into()];
+        app.type_picker_commit();
+        app.settle();
+        assert!(!app.items.is_empty());
+        assert!(app.items.iter().all(|w| w.item_type == "Task"));
+        // Clearing the selection brings everything back.
+        app.open_type_picker();
+        app.type_picker.as_mut().unwrap().selected = Vec::new();
+        app.type_picker_commit();
+        app.settle();
+        assert!(app.items.iter().any(|w| w.item_type == "Epic"));
+    }
+
+    #[test]
+    fn type_picker_routes_through_context() {
+        let mut app = ready_app();
+        app.open_type_picker();
+        assert_eq!(app.context(), Context::TypeFilter);
+        app.type_picker_cancel();
+        assert_ne!(app.context(), Context::TypeFilter);
+    }
+
+    #[test]
+    fn type_default_not_applied_in_sync_path() {
+        // The sync `ready_app` path must leave `item_types` empty so existing
+        // tests that inspect Epic/Task items still see them.
+        let app = ready_app();
+        assert!(app.item_types.is_empty());
+    }
+
+    #[test]
+    fn type_default_applies_on_first_async_load() {
+        let cfg = Config {
+            org_url: "https://dev.azure.com/acme".into(),
+            project: "Widgets".into(),
+            ..Default::default()
+        };
+        let mut app = App::new(cfg);
+        app.timeframe = Timeframe::All;
+        // Mimic the real startup: kick off the first async refresh and drain it.
+        app.request_refresh();
+        app.settle();
+        assert_eq!(
+            app.item_types,
+            vec!["User Story".to_string(), "Feature".to_string()]
+        );
+        assert!(app.item_types_initialized);
+    }
+
+    #[test]
+    fn custom_timeframe_commit_sets_range() {
+        use crate::api::models::Date;
+        let mut app = ready_app();
+        app.apply(Action::OpenCustomTimeframe);
+        assert_eq!(app.context(), Context::IterationFilter);
+        // Simulate a valid range entry then commit.
+        let from = Date::new(2020, 1, 1);
+        let to = Date::today();
+        app.timeframe = Timeframe::Custom { from, to };
+        app.date_range = None;
+        assert!(matches!(app.timeframe, Timeframe::Custom { .. }));
+        // The label reflects the range.
+        assert!(app.timeframe.label().contains('…'));
+    }
+
+    #[test]
+    fn timeframe_matches_days_ago_presets() {
+        assert!(Timeframe::Today.matches_days_ago(0));
+        assert!(!Timeframe::Today.matches_days_ago(1));
+        assert!(Timeframe::ThisWeek.matches_days_ago(7));
+        assert!(!Timeframe::ThisWeek.matches_days_ago(8));
+        assert!(Timeframe::All.matches_days_ago(999));
+    }
+
+    #[test]
+    fn timeframe_wiql_clause_for_presets() {
+        assert!(Timeframe::All.wiql_clause().is_none());
+        assert!(
+            Timeframe::ThisSprint
+                .wiql_clause()
+                .unwrap()
+                .contains("@Today - 14")
+        );
+        use crate::api::models::Date;
+        let tf = Timeframe::Custom {
+            from: Date::new(2024, 1, 1),
+            to: Date::new(2024, 2, 1),
+        };
+        let clause = tf.wiql_clause().unwrap();
+        assert!(clause.contains("2024-01-01") && clause.contains("2024-02-01"));
+    }
+
+    #[test]
+    fn work_item_filter_matches_iteration_prefix() {
+        use crate::api::models::WorkItemFilter;
+        let app = ready_app();
+        let mut item = app.client.get(1001).unwrap();
+        item.iteration = "Proj\\Sprint 24".into();
+        item.changed_days_ago = 0;
+        // UNDER-style prefix match on the iteration path.
+        let f = WorkItemFilter {
+            timeframe: Timeframe::All,
+            iterations: vec!["Proj\\Sprint 24".into()],
+            item_types: Vec::new(),
+        };
+        assert!(f.matches(&item));
+        let f2 = WorkItemFilter {
+            timeframe: Timeframe::All,
+            iterations: vec!["Proj\\Sprint 25".into()],
+            item_types: Vec::new(),
+        };
+        assert!(!f2.matches(&item));
     }
 }

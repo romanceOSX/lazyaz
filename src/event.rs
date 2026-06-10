@@ -14,14 +14,36 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         app.apply(Action::Quit);
         return;
     }
-    // 1. Floating field editor is modal.
-    if app.info_editor.is_some() {
-        handle_info_editor(app, key);
+    // 1. Resolution-options menu is modal (can be triggered from the editor).
+    if app.resolution.is_some() {
+        handle_resolution(app, key);
         return;
     }
-    // 2. Unresolved conflict is modal.
-    if app.conflict.is_some() {
-        handle_conflict(app, key);
+    // 2. Floating tags editor / state picker are modal (opened from the field
+    //    editor, so they must intercept before it).
+    if app.tags_editor.is_some() {
+        handle_tags_editor(app, key);
+        return;
+    }
+    if app.state_picker.is_some() {
+        handle_state_picker(app, key);
+        return;
+    }
+    if app.iteration_picker.is_some() {
+        handle_iteration_picker(app, key);
+        return;
+    }
+    if app.date_range.is_some() {
+        handle_date_range(app, key);
+        return;
+    }
+    if app.type_picker.is_some() {
+        handle_type_picker(app, key);
+        return;
+    }
+    // 3. Floating field editor is modal.
+    if app.info_editor.is_some() {
+        handle_info_editor(app, key);
         return;
     }
     // 3. Help popup.
@@ -71,26 +93,93 @@ fn handle_info_editor(app: &mut App, key: KeyEvent) {
     }
 }
 
-fn handle_conflict(app: &mut App, key: KeyEvent) {
+fn handle_state_picker(app: &mut App, key: KeyEvent) {
     match key.code {
+        KeyCode::Esc => app.state_picker_cancel(),
+        KeyCode::Enter => app.state_picker_select(),
+        _ => {
+            if let Some(p) = app.state_picker.as_mut() {
+                p.handle(key);
+            }
+        }
+    }
+}
+
+fn handle_tags_editor(app: &mut App, key: KeyEvent) {
+    if let Some(t) = app.tags_editor.as_mut() {
+        match t.handle(key) {
+            Some(true) => app.tags_editor_commit(),
+            Some(false) => app.tags_editor_cancel(),
+            None => {}
+        }
+    }
+}
+
+fn handle_iteration_picker(app: &mut App, key: KeyEvent) {
+    if let Some(p) = app.iteration_picker.as_mut() {
+        match p.handle(key) {
+            Some(true) => app.iteration_picker_commit(),
+            Some(false) => app.iteration_picker_cancel(),
+            None => {}
+        }
+    }
+}
+
+fn handle_type_picker(app: &mut App, key: KeyEvent) {
+    if let Some(p) = app.type_picker.as_mut() {
+        match p.handle(key) {
+            Some(true) => app.type_picker_commit(),
+            Some(false) => app.type_picker_cancel(),
+            None => {}
+        }
+    }
+}
+
+fn handle_date_range(app: &mut App, key: KeyEvent) {
+    if let Some(d) = app.date_range.as_mut() {
+        match d.handle(key) {
+            Some(true) => app.date_range_commit(),
+            Some(false) => app.date_range_cancel(),
+            None => {}
+        }
+    }
+}
+
+fn handle_resolution(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => app.resolution_nav(1),
+        KeyCode::Char('k') | KeyCode::Up => app.resolution_nav(-1),
         KeyCode::Char('m') => app.apply(Action::ResolveMerge),
         KeyCode::Char('f') => app.apply(Action::ResolveForce),
-        KeyCode::Esc => {
-            app.conflict = None;
-            app.status = "conflict dismissed (no changes saved)".into();
-        }
+        KeyCode::Esc => app.resolution_cancel(),
         _ => {}
     }
 }
 
 fn handle_help(app: &mut App, key: KeyEvent) {
     let matches = help::filtered(app);
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let searching = !app.help.input.value().trim().is_empty();
     match key.code {
         KeyCode::Esc => app.apply(Action::ToggleHelp),
         KeyCode::Down => {
             app.help.selected = (app.help.selected + 1).min(matches.len().saturating_sub(1))
         }
         KeyCode::Up => app.help.selected = app.help.selected.saturating_sub(1),
+        KeyCode::Char('n') if ctrl => {
+            app.help.selected = (app.help.selected + 1).min(matches.len().saturating_sub(1))
+        }
+        KeyCode::Char('p') if ctrl => app.help.selected = app.help.selected.saturating_sub(1),
+        // Tab / Ctrl-y autocomplete the highlighted binding's description into
+        // the query (only while searching).
+        KeyCode::Tab | KeyCode::Char('y')
+            if searching && (key.code != KeyCode::Char('y') || ctrl) =>
+        {
+            if let Some(b) = matches.get(app.help.selected) {
+                app.help.input = crate::ui::input::TextInput::new(b.desc);
+                app.help.selected = 0;
+            }
+        }
         KeyCode::Enter => {
             if let Some(b) = matches.get(app.help.selected) {
                 let action = b.action;
@@ -178,12 +267,34 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
         KeyCode::Char('f') if ctx == Context::WorkItems => app.apply(Action::NextFilter),
         KeyCode::Char('F') if ctx == Context::WorkItems => app.apply(Action::PrevFilter),
         KeyCode::Char('r') if ctx == Context::WorkItems => app.apply(Action::Reload),
+        KeyCode::Char('i')
+            if matches!(ctx, Context::WorkItems | Context::Tree) =>
+        {
+            app.apply(Action::OpenIterationFilter)
+        }
+        KeyCode::Char('t') if ctx == Context::WorkItems => {
+            app.apply(Action::OpenTypeFilter)
+        }
+        KeyCode::Char('c')
+            if matches!(ctx, Context::WorkItems | Context::Tree) =>
+        {
+            app.apply(Action::OpenCustomTimeframe)
+        }
 
         // Detail context
         KeyCode::Char('e') if ctx == Context::Detail => app.apply(Action::Edit),
         KeyCode::Char('n') if ctx == Context::Detail => app.apply(Action::EditNotes),
         KeyCode::Char('c') if ctx == Context::Detail => app.apply(Action::AddComment),
+        KeyCode::Char('d') if ctx == Context::Detail => app.apply(Action::DeleteComment),
+        KeyCode::Char('p') if ctx == Context::Detail => app.apply(Action::Push),
         KeyCode::Char('X') if ctx == Context::Detail => app.apply(Action::SimulateRemote),
+
+        // Open the selected/current work item in the ADO web UI (any item view).
+        KeyCode::Char('o')
+            if matches!(ctx, Context::Tree | Context::WorkItems | Context::Detail) =>
+        {
+            app.apply(Action::OpenInBrowser)
+        }
 
         // Config context
         KeyCode::Char('i') if ctx == Context::Config => app.apply(Action::EditField),

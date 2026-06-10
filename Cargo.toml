@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
+arboard = { version = "3.4", default-features = false }
 base64 = "0.22.1"
 crossterm = "0.29.0"
 directories = "6.0.0"

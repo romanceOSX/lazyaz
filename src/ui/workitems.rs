@@ -44,7 +44,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
             ListItem::new(Line::from(vec![
                 Span::styled(format!("#{:<5}", w.id), Style::default().fg(theme::DIM)),
                 Span::styled(format!("{:<11}", w.item_type), Style::default().fg(Color::Magenta)),
-                Span::styled(format!("{:<9}", w.state.to_string()), Style::default().fg(state_color(w.state))),
+                Span::styled(format!("{:<9}", w.state_name), Style::default().fg(state_color(w.state))),
                 Span::raw(w.title.clone()),
             ]))
         })

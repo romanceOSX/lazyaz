@@ -120,14 +120,35 @@ impl OAuthAuthenticator {
             .json()
             .context("parsing device code response")?;
 
-        // Show the user what to do, then open the browser.
+        // Show the user what to do, copy the code to the clipboard, then open
+        // the browser. The clipboard handle is kept alive for the duration of
+        // the polling loop so the code survives on clipboard managers (notably
+        // X11) that only serve content while the owning process is running.
         let msg = dc.message.clone().unwrap_or_else(|| {
             format!(
                 "To sign in, open {} and enter code {}",
                 dc.verification_uri, dc.user_code
             )
         });
-        eprintln!("\n{msg}\n");
+        let _clipboard = match arboard::Clipboard::new() {
+            Ok(mut cb) => match cb.set_text(dc.user_code.clone()) {
+                Ok(()) => {
+                    eprintln!(
+                        "\n{msg}\n(verification code {} copied to clipboard)\n",
+                        dc.user_code
+                    );
+                    Some(cb)
+                }
+                Err(_) => {
+                    eprintln!("\n{msg}\n");
+                    None
+                }
+            },
+            Err(_) => {
+                eprintln!("\n{msg}\n");
+                None
+            }
+        };
         let _ = open::that(&dc.verification_uri);
 
         // Poll for the token.

@@ -40,10 +40,22 @@ pub fn render(f: &mut Frame, app: &App) {
 
     let area = centered(f.area(), 64, 70);
     f.render_widget(Clear, area);
+    // The editor border turns yellow while it holds un-pushed local edits.
+    let any_pending = EDITABLE_FIELDS.iter().any(|f| app.field_pending(f.key));
+    let border_color = if any_pending {
+        ratatui::style::Color::Yellow
+    } else {
+        theme::ACCENT
+    };
+    let title = if any_pending {
+        format!(" Edit {item_type} #{} · ● unpushed (p to push) ", ed.id)
+    } else {
+        format!(" Edit {item_type} #{} ", ed.id)
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::ACCENT))
-        .title(format!(" Edit {item_type} #{} ", ed.id));
+        .border_style(Style::default().fg(border_color))
+        .title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -73,6 +85,13 @@ pub fn render(f: &mut Frame, app: &App) {
                     }
                 }
                 spans.push(Span::raw(val));
+                // Flag fields with an un-pushed local edit.
+                if app.field_pending(field.key) {
+                    spans.push(Span::styled(
+                        " ●",
+                        Style::default().fg(ratatui::style::Color::Yellow),
+                    ));
+                }
             }
             ListItem::new(Line::from(spans))
         })

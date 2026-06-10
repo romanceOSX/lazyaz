@@ -7,8 +7,6 @@
 use crate::app::App;
 use crate::keys::{bindings_for, Binding};
 use crate::ui::theme;
-use fuzzy_matcher::skim::SkimMatcherV2;
-use fuzzy_matcher::FuzzyMatcher;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -18,20 +16,12 @@ use ratatui::Frame;
 /// Bindings matching the current help-input, ranked by fuzzy score.
 pub fn filtered(app: &App) -> Vec<&'static Binding> {
     let all = bindings_for(app.context());
-    let query = app.help.input.value();
-    if query.trim().is_empty() {
-        return all;
-    }
-    let matcher = SkimMatcherV2::default();
-    let mut scored: Vec<(i64, &'static Binding)> = all
-        .into_iter()
-        .filter_map(|b| {
-            let hay = format!("{} {}", b.keys, b.desc);
-            matcher.fuzzy_match(&hay, &query).map(|score| (score, b))
-        })
-        .collect();
-    scored.sort_by_key(|b| std::cmp::Reverse(b.0));
-    scored.into_iter().map(|(_, b)| b).collect()
+    crate::ui::fuzzy::rank(&all, &app.help.input.value(), |b| {
+        [format!("{} {}", b.keys, b.desc)]
+    })
+    .into_iter()
+    .copied()
+    .collect()
 }
 
 fn centered(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
