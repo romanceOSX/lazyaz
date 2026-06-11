@@ -16,7 +16,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         .flat
         .iter()
         .map(|(id, depth)| {
-            let item = app.items.iter().find(|w| w.id == *id);
+            let item = app.tree_item(*id);
             let indent = "  ".repeat(*depth);
             let marker = if app.tree_has_children(*id) {
                 if app.tree.expanded.contains(id) { "▾ " } else { "▸ " }

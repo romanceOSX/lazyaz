@@ -267,6 +267,7 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
         KeyCode::Char('f') if ctx == Context::WorkItems => app.apply(Action::NextFilter),
         KeyCode::Char('F') if ctx == Context::WorkItems => app.apply(Action::PrevFilter),
         KeyCode::Char('r') if ctx == Context::WorkItems => app.apply(Action::Reload),
+        KeyCode::Char('v') if ctx == Context::WorkItems => app.apply(Action::ViewInTree),
         KeyCode::Char('i')
             if matches!(ctx, Context::WorkItems | Context::Tree) =>
         {

@@ -27,8 +27,8 @@ const LIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Tab {
-    #[default]
     Tree,
+    #[default]
     WorkItems,
     Detail,
     Config,
@@ -252,6 +252,12 @@ pub struct App {
     pub item_types_initialized: bool,
 
     pub tree: TreeState,
+    /// The tree's own dataset: the connected relationship graph (ancestors +
+    /// descendants) of [`App::tree_focus`], fetched directly from the client so
+    /// it is independent of the timeframe / iteration / type filters.
+    pub tree_items: Vec<WorkItem>,
+    /// The work item the tree is currently anchored on.
+    pub tree_focus: Option<u32>,
 
     pub current: Option<WorkItem>,
     /// Titles of the open item's parent/children, fetched once when the item is
@@ -380,7 +386,8 @@ impl App {
         let (push_tx, push_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             wizard,
-            tab: Tab::Tree,
+            // Default landing view: the current iteration's work items.
+            tab: Tab::WorkItems,
             mode: Mode::Normal,
             should_quit: false,
             status: "Welcome to lazyaz — press ? for help".into(),
@@ -398,6 +405,8 @@ impl App {
             type_picker: None,
             item_types_initialized: false,
             tree: TreeState::default(),
+            tree_items: Vec::new(),
+            tree_focus: None,
             current: None,
             related_titles: HashMap::new(),
             detail_focus: DetailFocus::Info,
@@ -483,7 +492,8 @@ impl App {
                 self.set_current(item);
                 self.detail_selected = s.detail_selected;
             }
-        self.tab = s.tab;
+        // goto_tab anchors the relationship tree if we land on the Tree tab.
+        self.goto_tab(s.tab);
         self.status = "restored last session".into();
     }
 
@@ -600,7 +610,9 @@ impl App {
                 .min(self.items.len() - 1);
             self.list_state.select(Some(sel));
         }
-        self.rebuild_tree();
+        // The relationship tree is intentionally NOT rebuilt here: it is scoped
+        // to a focus item and independent of the (timeframe/iteration/type)
+        // filter that produced this list.
         self.status = format!(
             "{} item(s) · timeframe: {}",
             self.items.len(),
@@ -854,17 +866,17 @@ impl App {
 
     // --- tree ---
     fn rebuild_tree(&mut self) {
-        let ids: HashSet<u32> = self.items.iter().map(|w| w.id).collect();
+        let ids: HashSet<u32> = self.tree_items.iter().map(|w| w.id).collect();
         // First build: expand every node that has children.
         if self.tree.expanded.is_empty() {
-            for w in &self.items {
+            for w in &self.tree_items {
                 if !w.children.is_empty() {
                     self.tree.expanded.insert(w.id);
                 }
             }
         }
         let mut roots: Vec<u32> = self
-            .items
+            .tree_items
             .iter()
             .filter(|w| w.parent.is_none_or(|p| !ids.contains(&p)))
             .map(|w| w.id)
@@ -873,7 +885,7 @@ impl App {
 
         let mut flat = Vec::new();
         for r in roots {
-            flatten(&self.items, &self.tree.expanded, r, 0, &mut flat);
+            flatten(&self.tree_items, &self.tree.expanded, r, 0, &mut flat);
         }
         self.tree.flat = flat;
         if self.tree.selected >= self.tree.flat.len() {
@@ -881,10 +893,105 @@ impl App {
         }
     }
 
+    pub fn tree_item(&self, id: u32) -> Option<&WorkItem> {
+        self.tree_items.iter().find(|w| w.id == id)
+    }
+
     pub fn tree_has_children(&self, id: u32) -> bool {
-        self.items
+        self.tree_items
             .iter()
             .any(|w| w.id == id && !w.children.is_empty())
+    }
+
+    /// Load the tree's dataset as the connected relationship graph of `focus`:
+    /// walk up to every ancestor and down to every descendant via `client.get`,
+    /// which ignores the list filters. Expands the whole graph and selects the
+    /// focus item. Synchronous — invoked on explicit navigation (`v` / entering
+    /// the Tree tab); for the mock it's instant.
+    fn load_tree_for(&mut self, focus: u32) {
+        let mut collected: HashMap<u32, WorkItem> = HashMap::new();
+        let mut queue = vec![focus];
+        while let Some(id) = queue.pop() {
+            if collected.contains_key(&id) {
+                continue;
+            }
+            match self.client.get(id) {
+                Ok(item) => {
+                    if let Some(p) = item.parent
+                        && !collected.contains_key(&p) {
+                            queue.push(p);
+                        }
+                    for c in &item.children {
+                        if !collected.contains_key(c) {
+                            queue.push(*c);
+                        }
+                    }
+                    collected.insert(id, item);
+                }
+                Err(_) => continue, // skip unreachable relations
+            }
+        }
+        self.tree_items = collected.into_values().collect();
+        self.tree.expanded = self.tree_items.iter().map(|w| w.id).collect();
+        self.tree_focus = Some(focus);
+        self.rebuild_tree();
+        self.tree.selected = self
+            .tree
+            .flat
+            .iter()
+            .position(|(fid, _)| *fid == focus)
+            .unwrap_or(0);
+    }
+
+    /// Pick the anchor for the tree (open item → list selection → first item)
+    /// and (re)load its relationship graph if it isn't already shown.
+    fn ensure_tree_anchored(&mut self) {
+        let anchor = self
+            .current
+            .as_ref()
+            .map(|w| w.id)
+            .or_else(|| {
+                self.list_state
+                    .selected()
+                    .and_then(|i| self.items.get(i))
+                    .map(|w| w.id)
+            })
+            .or_else(|| self.items.first().map(|w| w.id));
+        match anchor {
+            Some(id) if self.tree_focus != Some(id) || self.tree_items.is_empty() => {
+                self.load_tree_for(id)
+            }
+            Some(_) => {}
+            None => {
+                self.tree_items.clear();
+                self.tree.flat.clear();
+            }
+        }
+    }
+
+    /// Switch tabs, anchoring the relationship tree when landing on it.
+    fn goto_tab(&mut self, tab: Tab) {
+        self.tab = tab;
+        if tab == Tab::Tree {
+            self.ensure_tree_anchored();
+        }
+    }
+
+    /// `v` from the work-items list: focus the tree on the selected item and
+    /// show its relationship graph (parents, the item, and descendants).
+    fn view_in_tree(&mut self) {
+        let Some(id) = self
+            .list_state
+            .selected()
+            .and_then(|i| self.items.get(i))
+            .map(|w| w.id)
+        else {
+            self.status = "no item selected".into();
+            return;
+        };
+        self.load_tree_for(id);
+        self.tab = Tab::Tree;
+        self.status = format!("#{id} — related items in tree view");
     }
 
     fn tree_selected_id(&self) -> Option<u32> {
@@ -971,13 +1078,14 @@ impl App {
                 self.help.input.clear();
                 self.help.selected = 0;
             }
-            Action::NextTab => self.tab = Tab::ORDER[(self.tab.index() + 1) % Tab::ORDER.len()],
-            Action::PrevTab => {
-                self.tab = Tab::ORDER[(self.tab.index() + Tab::ORDER.len() - 1) % Tab::ORDER.len()]
+            Action::NextTab => {
+                self.goto_tab(Tab::ORDER[(self.tab.index() + 1) % Tab::ORDER.len()])
             }
+            Action::PrevTab => self
+                .goto_tab(Tab::ORDER[(self.tab.index() + Tab::ORDER.len() - 1) % Tab::ORDER.len()]),
             Action::GotoTab(n) => {
                 if let Some(t) = Tab::ORDER.get(n as usize) {
-                    self.tab = *t;
+                    self.goto_tab(*t);
                 }
             }
             Action::Down => self.move_selection(1),
@@ -1000,6 +1108,7 @@ impl App {
             }
             Action::Open => self.open(),
             Action::Back => self.tab = Tab::WorkItems,
+            Action::ViewInTree => self.view_in_tree(),
             Action::FocusNext => self.detail_focus = self.detail_focus.step(1),
             Action::FocusPrev => self.detail_focus = self.detail_focus.step(-1),
             Action::TreeExpand => self.tree_set_expanded(true),
@@ -1833,7 +1942,7 @@ impl App {
                     .reconfigure(&self.config.org_url, &self.config.project);
                 let _ = self.config.save();
                 self.wizard = None;
-                self.tab = Tab::Tree;
+                self.tab = Tab::WorkItems;
                 self.reload_items();
                 self.status = "setup complete".into();
             }
@@ -2018,6 +2127,7 @@ mod tests {
     #[test]
     fn tree_flattens_and_collapses() {
         let mut app = ready_app();
+        app.load_tree_for(1001); // anchor the tree on the epic
         // Epic 1001 expanded shows its two story children.
         assert!(app.tree.flat.iter().any(|(id, _)| *id == 1002));
         // Select the epic and collapse it; children disappear.
@@ -2032,6 +2142,8 @@ mod tests {
     #[test]
     fn tree_open_navigates_to_detail() {
         let mut app = ready_app();
+        app.load_tree_for(1002);
+        app.tab = Tab::Tree;
         app.tree.selected = app.tree.flat.iter().position(|(id, _)| *id == 1002).unwrap();
         app.apply(Action::Open);
         assert_eq!(app.tab, Tab::Detail);
@@ -2040,6 +2152,48 @@ mod tests {
         // the backend while navigating panes.
         for rel in app.related_ids() {
             assert!(app.related_title(rel).is_some(), "title for #{rel} should be cached");
+        }
+    }
+
+    #[test]
+    fn default_landing_tab_is_work_items() {
+        assert_eq!(Tab::default(), Tab::WorkItems);
+        let app = ready_app();
+        assert_eq!(app.tab, Tab::WorkItems);
+    }
+
+    #[test]
+    fn view_in_tree_centres_on_selected_item_with_ancestors() {
+        let mut app = ready_app();
+        // #1004 is a Task under #1002 (User Story) under #1001 (Epic).
+        let idx = app.items.iter().position(|w| w.id == 1004).unwrap();
+        app.list_state.select(Some(idx));
+        app.view_in_tree();
+        assert_eq!(app.tab, Tab::Tree);
+        // The item and its whole ancestor chain are expanded…
+        for ancestor in [1004u32, 1002, 1001] {
+            assert!(app.tree.expanded.contains(&ancestor), "#{ancestor} expanded");
+        }
+        // …and the cursor lands on the item itself.
+        assert_eq!(app.tree.flat[app.tree.selected].0, 1004);
+        // Its parent and children are present in the flattened view.
+        let ids: Vec<u32> = app.tree.flat.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&1002)); // parent
+        assert!(ids.contains(&1005)); // sibling/child of 1002
+    }
+
+    #[test]
+    fn tree_is_independent_of_timeframe_filter() {
+        let mut app = ready_app();
+        // Narrow the list filter so most items drop out of the work-items list…
+        app.timeframe = Timeframe::Today;
+        app.reload_items();
+        // …yet the relationship tree, anchored on #1004, still shows the whole
+        // family (#1005 was last changed 12 days ago, well outside "Today").
+        app.load_tree_for(1004);
+        let ids: Vec<u32> = app.tree.flat.iter().map(|(id, _)| *id).collect();
+        for related in [1001u32, 1002, 1003, 1004, 1005] {
+            assert!(ids.contains(&related), "#{related} should be in the tree");
         }
     }
 

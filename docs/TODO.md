@@ -81,10 +81,23 @@ What would be an ergonomic way of achieving this within the TUI?
 - [x] **Active-filter chips** in the status bar show the current iteration,
       timeframe, and item type (`iter:… · tf:… · type:…`).
 
-## Working Items
-- [ ] Is 'Working items' the correct term? what is the term for referring to an item in
-      ADO? a concept that encapsulates User Stories, Tasks, Epics, Features and so on
-- [ ] When hitting 'v' we should get redirected to a 'tree' view of the current item being navigated
-      this tree will show us its parents and children
-
+## Work Items
+- [x] **Terminology.** The ADO umbrella concept is a **Work Item** (a User Story,
+      Task, Bug, Epic, Feature, etc. are all *types* of work item). So the correct
+      term is "Work Item(s)", not "Working Items" — which the code already uses
+      (`WorkItem`, `WorkItemClient`, the "Work Items" tab). Doc heading fixed.
+- [x] **`v` → view item in tree.** In the Work Items pane, `v` switches to the
+      Tree tab centred on the selected item.
+- [x] **Tree is a relationship view, independent of the filters.** The Tree tab
+      no longer mirrors the (timeframe/iteration/type) filtered list. It has its
+      own dataset (`App::tree_items`) — the connected relationship graph
+      (ancestors + descendants) of a focus item (`App::tree_focus`), fetched
+      directly via `client.get` so the timeframe filter doesn't hide related
+      items. The focus is the selected item on `v`, or the open/selected item
+      when you switch to the Tree tab. Fetch is synchronous on that navigation;
+      a background fetch (like the list refresh worker) is a possible follow-up.
+- [x] **Work Items is the default landing window.** `Tab::default()` and the
+      startup tab are now `WorkItems`; combined with the iteration filter
+      defaulting to the current sprint on first load, you land on the current
+      iteration's work items.
 
