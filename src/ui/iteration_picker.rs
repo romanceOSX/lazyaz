@@ -1,8 +1,9 @@
-//! Floating fuzzy multi-select for the iteration (sprint) filter. Fuzzy-filter
-//! the team's iterations, navigate with `^n`/`^p` (or arrows), toggle which
-//! ones to show with Space/Enter, and apply with Tab (when the query is empty).
-//! While searching, Tab/`^y` autocomplete the highlighted iteration into the
-//! query. The current iteration is marked with `● current`.
+//! Floating fuzzy multi-select for the iteration (sprint) filter. Type to
+//! fuzzy-filter; navigate with `^n`/`^p` or the arrow keys; toggle which
+//! iterations to show with Tab or Space; submit with Enter. The list stays in
+//! chronological order and the cursor starts on the current iteration so the
+//! next/previous sprint is one keystroke away. The current iteration is marked
+//! with `● current`.
 
 use crate::api::models::Iteration;
 use crate::ui::input::TextInput;
@@ -25,30 +26,15 @@ pub struct IterationPicker {
 
 impl IterationPicker {
     pub fn new(options: Vec<Iteration>, selected: Vec<String>) -> Self {
+        // Keep the iterations in their given (chronological) order and start the
+        // cursor on the current one, so up/down reach the previous/next sprint.
+        let cursor = options.iter().position(|i| i.is_current).unwrap_or(0);
         Self {
-            options: Self::order_relative_to_current(options),
+            options,
             selected,
             input: TextInput::default(),
-            cursor: 0,
+            cursor,
         }
-    }
-
-    /// Order iterations relative to the current one: the current iteration
-    /// first, then the rest by proximity to it in the (chronological) list,
-    /// preferring upcoming sprints over past ones at equal distance. If no
-    /// iteration is marked current, the original order is preserved.
-    fn order_relative_to_current(options: Vec<Iteration>) -> Vec<Iteration> {
-        let Some(current) = options.iter().position(|i| i.is_current) else {
-            return options;
-        };
-        let mut ordered: Vec<(usize, Iteration)> = options.into_iter().enumerate().collect();
-        ordered.sort_by_key(|(idx, _)| {
-            let delta = *idx as i64 - current as i64;
-            // Primary: absolute distance from current; secondary: future before
-            // past (a future sprint has delta > 0, so it sorts first on ties).
-            (delta.abs(), -delta)
-        });
-        ordered.into_iter().map(|(_, it)| it).collect()
     }
 
     /// Iterations matching the current query, ranked by fuzzy score (matched on
@@ -75,36 +61,27 @@ impl IterationPicker {
     /// `None` to stay open.
     pub fn handle(&mut self, key: KeyEvent) -> Option<bool> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let searching = !self.input.value().trim().is_empty();
         match key.code {
             KeyCode::Esc => return Some(false),
+            // Navigate the list: arrows or ^n / ^p.
             KeyCode::Up => self.cursor = self.cursor.saturating_sub(1),
+            KeyCode::Char('p') if ctrl => self.cursor = self.cursor.saturating_sub(1),
             KeyCode::Down => {
                 let max = self.matches().len().saturating_sub(1);
                 self.cursor = (self.cursor + 1).min(max);
             }
-            KeyCode::Char('p') if ctrl => self.cursor = self.cursor.saturating_sub(1),
             KeyCode::Char('n') if ctrl => {
                 let max = self.matches().len().saturating_sub(1);
                 self.cursor = (self.cursor + 1).min(max);
             }
-            // Tab / Ctrl-y autocomplete the highlighted iteration into the query
-            // while searching; with an empty query, Tab applies the selection
-            // (and Ctrl-y is a no-op).
-            KeyCode::Tab | KeyCode::Char('y')
-                if searching && (key.code != KeyCode::Char('y') || ctrl) =>
-            {
-                if let Some(name) = self.matches().get(self.cursor).map(|it| it.name.clone()) {
-                    self.input = TextInput::new(&name);
-                    self.cursor = 0;
-                }
-            }
-            KeyCode::Tab => return Some(true),
-            KeyCode::Char(' ') | KeyCode::Enter => {
+            // Tab or Space toggle the highlighted checkbox.
+            KeyCode::Tab | KeyCode::Char(' ') => {
                 if let Some(path) = self.matches().get(self.cursor).map(|it| it.path.clone()) {
                     self.toggle(&path);
                 }
             }
+            // Enter submits the query.
+            KeyCode::Enter => return Some(true),
             _ => {
                 if self.input.handle(key) {
                     self.cursor = 0;
@@ -133,7 +110,7 @@ impl IterationPicker {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme::ACCENT))
-            .title(" Iterations (^n/^p move · Tab complete · Space toggle · Esc cancel) ");
+            .title(" Iterations (^n/^p move · Tab/Space toggle · Enter apply · Esc cancel) ");
         let inner = block.inner(rect);
         f.render_widget(block, rect);
 
@@ -216,33 +193,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn orders_iterations_relative_to_current() {
-        // Chronological input: 22, 23, 24(current), 25, 26.
-        let opts = vec![
-            iter("Sprint 22", false),
-            iter("Sprint 23", false),
-            iter("Sprint 24", true),
-            iter("Sprint 25", false),
-            iter("Sprint 26", false),
-        ];
-        let picker = IterationPicker::new(opts, Vec::new());
-        let names: Vec<&str> = picker.options.iter().map(|i| i.name.as_str()).collect();
-        // Current first, then nearest neighbours (future before past on ties).
-        assert_eq!(
-            names,
-            vec!["Sprint 24", "Sprint 25", "Sprint 23", "Sprint 26", "Sprint 22"]
-        );
-    }
-
-    #[test]
-    fn preserves_order_when_no_current() {
-        let opts = vec![iter("Sprint 23", false), iter("Sprint 24", false)];
-        let picker = IterationPicker::new(opts, Vec::new());
-        let names: Vec<&str> = picker.options.iter().map(|i| i.name.as_str()).collect();
-        assert_eq!(names, vec!["Sprint 23", "Sprint 24"]);
-    }
-
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
@@ -252,7 +202,36 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_n_p_navigate_the_list() {
+    fn cursor_starts_on_current_iteration() {
+        // Chronological input: 22, 23, 24(current), 25, 26.
+        let opts = vec![
+            iter("Sprint 22", false),
+            iter("Sprint 23", false),
+            iter("Sprint 24", true),
+            iter("Sprint 25", false),
+            iter("Sprint 26", false),
+        ];
+        let picker = IterationPicker::new(opts, Vec::new());
+        // Order preserved (chronological)…
+        let names: Vec<&str> = picker.options.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["Sprint 22", "Sprint 23", "Sprint 24", "Sprint 25", "Sprint 26"]
+        );
+        // …and the cursor sits on the current iteration.
+        assert_eq!(picker.cursor, 2);
+        assert!(picker.matches()[picker.cursor].is_current);
+    }
+
+    #[test]
+    fn cursor_defaults_to_zero_without_current() {
+        let opts = vec![iter("Sprint 23", false), iter("Sprint 24", false)];
+        let picker = IterationPicker::new(opts, Vec::new());
+        assert_eq!(picker.cursor, 0);
+    }
+
+    #[test]
+    fn ctrl_n_p_and_arrows_navigate_the_list() {
         let opts = vec![iter("Sprint 23", true), iter("Sprint 24", false)];
         let mut picker = IterationPicker::new(opts, Vec::new());
         assert_eq!(picker.cursor, 0);
@@ -260,31 +239,28 @@ mod tests {
         assert_eq!(picker.cursor, 1);
         picker.handle(ctrl('p'));
         assert_eq!(picker.cursor, 0);
+        picker.handle(key(KeyCode::Down));
+        assert_eq!(picker.cursor, 1);
+        picker.handle(key(KeyCode::Up));
+        assert_eq!(picker.cursor, 0);
     }
 
     #[test]
-    fn tab_and_ctrl_y_autocomplete_while_searching() {
-        let opts = vec![iter("Sprint 23", true), iter("Backlog", false)];
-        // Tab fills the query with the highlighted match and does not apply.
-        let mut p = IterationPicker::new(opts.clone(), Vec::new());
-        for c in "spr".chars() {
-            p.handle(key(KeyCode::Char(c)));
-        }
+    fn tab_and_space_toggle_the_checkbox() {
+        let opts = vec![iter("Sprint 23", true), iter("Sprint 24", false)];
+        let mut p = IterationPicker::new(opts, Vec::new());
+        // Cursor starts on the current iteration (Sprint 23).
         assert_eq!(p.handle(key(KeyCode::Tab)), None);
-        assert_eq!(p.input.value(), "Sprint 23");
-        // Ctrl-y does the same.
-        let mut p2 = IterationPicker::new(opts, Vec::new());
-        for c in "spr".chars() {
-            p2.handle(key(KeyCode::Char(c)));
-        }
-        assert_eq!(p2.handle(ctrl('y')), None);
-        assert_eq!(p2.input.value(), "Sprint 23");
+        assert!(p.is_selected("Proj\\Sprint 23"));
+        // Space toggles it back off.
+        assert_eq!(p.handle(key(KeyCode::Char(' '))), None);
+        assert!(!p.is_selected("Proj\\Sprint 23"));
     }
 
     #[test]
-    fn tab_applies_when_query_empty() {
+    fn enter_submits() {
         let opts = vec![iter("Sprint 23", true)];
         let mut p = IterationPicker::new(opts, Vec::new());
-        assert_eq!(p.handle(key(KeyCode::Tab)), Some(true));
+        assert_eq!(p.handle(key(KeyCode::Enter)), Some(true));
     }
 }
