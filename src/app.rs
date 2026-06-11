@@ -587,6 +587,16 @@ impl App {
         }
     }
 
+    /// The single active time filter (iteration-based or timeframe-based — they
+    /// are mutually exclusive) for the status bar.
+    pub fn time_filter_label(&self) -> String {
+        if !self.selected_iterations.is_empty() {
+            self.iteration_filter_label()
+        } else {
+            format!("tf:{}", self.timeframe.label())
+        }
+    }
+
     /// Short status-bar label summarising the type filter.
     pub fn type_filter_label(&self) -> String {
         match self.item_types.len() {
@@ -1093,11 +1103,11 @@ impl App {
             Action::Top => self.set_selection(0),
             Action::Bottom => self.set_selection(isize::MAX),
             Action::NextFilter => {
-                self.timeframe = self.timeframe.next();
+                self.set_timeframe(self.timeframe.next());
                 self.request_refresh();
             }
             Action::PrevFilter => {
-                self.timeframe = self.timeframe.prev();
+                self.set_timeframe(self.timeframe.prev());
                 self.request_refresh();
             }
             Action::Reload => self.request_refresh(),
@@ -1533,11 +1543,25 @@ impl App {
         ));
     }
 
+    /// Iteration-based and timeframe-based filtering are mutually exclusive.
+    /// Setting a real timeframe window clears any iteration selection; choosing
+    /// `All` leaves iterations untouched (it is the neutral "no time filter").
+    fn set_timeframe(&mut self, tf: Timeframe) {
+        self.timeframe = tf;
+        if tf != Timeframe::All {
+            self.selected_iterations.clear();
+        }
+    }
+
     pub fn iteration_picker_commit(&mut self) {
         if let Some(p) = &self.iteration_picker {
             self.selected_iterations = p.value();
         }
         self.iteration_picker = None;
+        // Iteration-based filtering replaces any active timeframe window.
+        if !self.selected_iterations.is_empty() {
+            self.timeframe = Timeframe::All;
+        }
         self.request_refresh();
     }
 
@@ -1572,7 +1596,7 @@ impl App {
         if let Some(d) = &self.date_range
             && let Some(tf) = d.value()
         {
-            self.timeframe = tf;
+            self.set_timeframe(tf); // custom window clears iteration filter
             self.date_range = None;
             self.request_refresh();
             return;
@@ -2183,6 +2207,29 @@ mod tests {
     }
 
     #[test]
+    fn timeframe_and_iteration_filters_are_mutually_exclusive() {
+        let mut app = ready_app();
+        // Selecting iterations clears any active timeframe window.
+        app.set_timeframe(Timeframe::ThisWeek);
+        assert_eq!(app.timeframe, Timeframe::ThisWeek);
+        app.open_iteration_picker();
+        app.iteration_picker.as_mut().unwrap().selected = vec!["Proj\\Sprint 24".into()];
+        app.iteration_picker_commit();
+        assert_eq!(app.selected_iterations, vec!["Proj\\Sprint 24".to_string()]);
+        assert_eq!(app.timeframe, Timeframe::All, "iteration filter clears timeframe");
+
+        // Setting a timeframe window clears the iteration selection.
+        app.set_timeframe(Timeframe::Today);
+        assert_eq!(app.timeframe, Timeframe::Today);
+        assert!(app.selected_iterations.is_empty(), "timeframe clears iterations");
+
+        // `All` is the neutral state and does NOT clear iterations.
+        app.selected_iterations = vec!["Proj\\Sprint 24".into()];
+        app.set_timeframe(Timeframe::All);
+        assert_eq!(app.selected_iterations, vec!["Proj\\Sprint 24".to_string()]);
+    }
+
+    #[test]
     fn tree_is_independent_of_timeframe_filter() {
         let mut app = ready_app();
         // Narrow the list filter so most items drop out of the work-items list…
@@ -2654,10 +2701,10 @@ mod tests {
     fn timeframe_wiql_clause_for_presets() {
         assert!(Timeframe::All.wiql_clause().is_none());
         assert!(
-            Timeframe::ThisSprint
+            Timeframe::ThisMonth
                 .wiql_clause()
                 .unwrap()
-                .contains("@Today - 14")
+                .contains("@Today - 30")
         );
         use crate::api::models::Date;
         let tf = Timeframe::Custom {

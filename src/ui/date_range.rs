@@ -1,7 +1,9 @@
 //! A small two-field modal for entering a custom `[from, to]` change-date
-//! window for the timeframe filter. Both fields accept `YYYY-MM-DD`.
+//! window for the timeframe filter. Both fields accept `YYYY-MM-DD` typed in
+//! place, or press `c` to pick the range on a calendar.
 
 use crate::api::models::{Date, Timeframe};
+use crate::ui::calendar::{CalResult, Calendar};
 use crate::ui::input::TextInput;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Alignment, Rect};
@@ -16,6 +18,8 @@ pub struct DateRangeInput {
     /// 0 = from, 1 = to.
     focus: usize,
     error: bool,
+    /// Active calendar overlay (opened with `c`).
+    calendar: Option<Calendar>,
 }
 
 impl DateRangeInput {
@@ -34,6 +38,7 @@ impl DateRangeInput {
             to: TextInput::new(&to),
             focus: 0,
             error: false,
+            calendar: None,
         }
     }
 
@@ -49,6 +54,20 @@ impl DateRangeInput {
 
     /// Returns `Some(true)` to apply, `Some(false)` to cancel, `None` to stay.
     pub fn handle(&mut self, key: KeyEvent) -> Option<bool> {
+        // While the calendar is open, all keys go to it.
+        if let Some(cal) = &mut self.calendar {
+            match cal.handle(key) {
+                CalResult::Done { from, to } => {
+                    self.from = TextInput::new(&from.to_iso());
+                    self.to = TextInput::new(&to.to_iso());
+                    self.error = false;
+                    self.calendar = None;
+                }
+                CalResult::Cancel => self.calendar = None,
+                CalResult::Continue => {}
+            }
+            return None;
+        }
         match key.code {
             KeyCode::Esc => return Some(false),
             KeyCode::Enter => {
@@ -59,6 +78,11 @@ impl DateRangeInput {
             }
             KeyCode::Tab | KeyCode::Down | KeyCode::Up => {
                 self.focus = 1 - self.focus;
+            }
+            // `c` opens the calendar, seeded on the current "from" date (or today).
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                let seed = Date::from_iso(&self.from.value()).unwrap_or_else(Date::today);
+                self.calendar = Some(Calendar::new(seed));
             }
             _ => {
                 let field = if self.focus == 0 {
@@ -101,7 +125,7 @@ impl DateRangeInput {
             ))
         } else {
             Line::from(ratatui::text::Span::styled(
-                "Tab switch · Enter apply · Esc cancel",
+                "Tab switch · c calendar · Enter apply · Esc cancel",
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::ITALIC),
@@ -119,5 +143,10 @@ impl DateRangeInput {
             .title(" Custom timeframe ")
             .title_alignment(Alignment::Center);
         f.render_widget(Paragraph::new(body).block(block), rect);
+
+        // The calendar overlays the whole area when open.
+        if let Some(cal) = &self.calendar {
+            cal.render(f, area);
+        }
     }
 }

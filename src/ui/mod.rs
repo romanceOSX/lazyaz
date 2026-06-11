@@ -1,3 +1,4 @@
+pub mod calendar;
 pub mod config_tab;
 pub mod detail;
 pub mod help;
@@ -114,14 +115,11 @@ fn status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             Style::default().fg(Color::DarkGray),
         ));
     }
-    // Active filters (iteration + timeframe), shown as chips.
+    // Active time filter (iteration- OR timeframe-based — mutually exclusive)
+    // and the type filter, shown as chips.
     spans.push(Span::styled(
-        format!(" {} ", app.iteration_filter_label()),
+        format!(" {} ", app.time_filter_label()),
         Style::default().fg(Color::Magenta),
-    ));
-    spans.push(Span::styled(
-        format!("tf:{} ", app.timeframe.label()),
-        Style::default().fg(Color::Blue),
     ));
     spans.push(Span::styled(
         format!("{} ", app.type_filter_label()),

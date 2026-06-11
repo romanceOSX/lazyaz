@@ -178,6 +178,52 @@ impl Date {
     pub fn days_until(self, other: Date) -> i64 {
         other.to_epoch_days() - self.to_epoch_days()
     }
+
+    /// This date shifted by `n` days (negative shifts backwards).
+    pub fn add_days(self, n: i64) -> Date {
+        Date::from_epoch_days(self.to_epoch_days() + n)
+    }
+
+    /// Day of week with Monday = 0 … Sunday = 6.
+    pub fn weekday_mon0(self) -> u32 {
+        // Epoch day 0 (1970-01-01) was a Thursday (= 3 with Monday = 0).
+        (self.to_epoch_days().rem_euclid(7) as u32 + 3) % 7
+    }
+
+    /// The first day of this date's month.
+    pub fn first_of_month(self) -> Date {
+        Date::new(self.year, self.month, 1)
+    }
+
+    /// Number of days in this date's month.
+    pub fn days_in_month(self) -> u32 {
+        let next = if self.month == 12 {
+            Date::new(self.year + 1, 1, 1)
+        } else {
+            Date::new(self.year, self.month + 1, 1)
+        };
+        self.first_of_month().days_until(next) as u32
+    }
+
+    /// This date with the month shifted by `delta` (clamping the day to the
+    /// target month's length).
+    pub fn add_months(self, delta: i32) -> Date {
+        let mut m = self.month as i32 - 1 + delta;
+        let mut y = self.year;
+        y += m.div_euclid(12);
+        m = m.rem_euclid(12);
+        let month = (m + 1) as u32;
+        let dim = Date::new(y, month, 1).days_in_month();
+        Date::new(y, month, self.day.min(dim))
+    }
+}
+
+/// Short month name for display (`Jan` … `Dec`).
+pub fn month_name(month: u32) -> &'static str {
+    const NAMES: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    NAMES[(month.clamp(1, 12) - 1) as usize]
 }
 
 /// Timeframe filter applied to the assigned-items list. The first four are
@@ -186,7 +232,7 @@ impl Date {
 pub enum Timeframe {
     Today,
     ThisWeek,
-    ThisSprint,
+    ThisMonth,
     #[default]
     All,
     /// An explicit `[from, to]` change-date window.
@@ -198,7 +244,7 @@ impl Timeframe {
     pub const ALL: [Timeframe; 4] = [
         Timeframe::Today,
         Timeframe::ThisWeek,
-        Timeframe::ThisSprint,
+        Timeframe::ThisMonth,
         Timeframe::All,
     ];
 
@@ -206,7 +252,7 @@ impl Timeframe {
         match self {
             Timeframe::Today => "Today".into(),
             Timeframe::ThisWeek => "This week".into(),
-            Timeframe::ThisSprint => "This sprint".into(),
+            Timeframe::ThisMonth => "This month".into(),
             Timeframe::All => "All".into(),
             Timeframe::Custom { from, to } => format!("{}…{}", from.to_iso(), to.to_iso()),
         }
@@ -219,7 +265,7 @@ impl Timeframe {
         match self {
             Timeframe::Today => days_ago == 0,
             Timeframe::ThisWeek => days_ago <= 7,
-            Timeframe::ThisSprint => days_ago <= 14,
+            Timeframe::ThisMonth => days_ago <= 30,
             Timeframe::All => true,
             Timeframe::Custom { from, to } => {
                 // changed-date = today - days_ago; keep it within [from, to].
@@ -238,7 +284,7 @@ impl Timeframe {
         match self {
             Timeframe::Today => Some("[System.ChangedDate] >= @Today".into()),
             Timeframe::ThisWeek => Some("[System.ChangedDate] >= @Today - 7".into()),
-            Timeframe::ThisSprint => Some("[System.ChangedDate] >= @Today - 14".into()),
+            Timeframe::ThisMonth => Some("[System.ChangedDate] >= @Today - 30".into()),
             Timeframe::All => None,
             Timeframe::Custom { from, to } => Some(format!(
                 "[System.ChangedDate] >= '{}' AND [System.ChangedDate] <= '{}'",
@@ -317,3 +363,31 @@ impl WorkItemFilter {
     }
 }
 
+
+#[cfg(test)]
+mod date_tests {
+    use super::*;
+
+    #[test]
+    fn days_in_month_handles_leap_years() {
+        assert_eq!(Date::new(2026, 2, 1).days_in_month(), 28);
+        assert_eq!(Date::new(2024, 2, 1).days_in_month(), 29); // leap
+        assert_eq!(Date::new(2026, 6, 1).days_in_month(), 30);
+        assert_eq!(Date::new(2026, 12, 1).days_in_month(), 31);
+    }
+
+    #[test]
+    fn add_months_clamps_day_and_wraps_year() {
+        // Jan 31 + 1 month → Feb 28 (clamped).
+        assert_eq!(Date::new(2026, 1, 31).add_months(1), Date::new(2026, 2, 28));
+        // Dec → Jan of next year.
+        assert_eq!(Date::new(2026, 12, 15).add_months(1), Date::new(2027, 1, 15));
+        assert_eq!(Date::new(2026, 1, 15).add_months(-1), Date::new(2025, 12, 15));
+    }
+
+    #[test]
+    fn weekday_is_monday_zero() {
+        // 2026-06-10 is a Wednesday → 2 with Monday = 0.
+        assert_eq!(Date::new(2026, 6, 10).weekday_mon0(), 2);
+    }
+}

@@ -70,8 +70,15 @@ What would be an ergonomic way of achieving this within the TUI?
       Selected paths persist across sessions and are pushed into WIQL as
       `[System.IterationPath] UNDER '…'` clauses (mock matches by prefix).
 - [x] **Filter by timeframe.** `f`/`F` cycle the quick presets (Today / This
-      week / This sprint / All) and `c` opens a custom `from…to` date-range
-      entry (`Timeframe::Custom`). Both compose (AND) with the iteration filter.
+      week / This month / All) and `c` opens a custom `from…to` date-range
+      entry (`Timeframe::Custom`). The custom menu accepts typed `YYYY-MM-DD`
+      dates *or* `c` spawns a month calendar (←↑↓→ / `hjkl` move, `[`/`]` change
+      month, Enter sets start then end, ordered automatically).
+- [x] **Iteration- vs timeframe-based filtering are mutually exclusive.** Only
+      one time filter is active at a time: choosing iterations resets the
+      timeframe to the neutral `All`, and selecting any timeframe window (preset
+      or custom) clears the iteration selection. The status bar shows a single
+      time chip reflecting whichever is active.
 - [x] **Filter by item type.** `t` (Work Items pane) opens a floating fuzzy
       multi-select of the work-item types (Task / User Story / Feature /
       Capability / Epic); Space/Enter toggles, Tab applies, Esc cancels.
