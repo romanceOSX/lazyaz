@@ -37,6 +37,19 @@ impl IterationPicker {
         }
     }
 
+    /// Replace the option list (used when the iterations finish loading while
+    /// the picker is already open). Keeps the current selection/query; recentres
+    /// the cursor on the current iteration when it was empty before.
+    pub fn refresh_options(&mut self, options: Vec<Iteration>) {
+        let was_empty = self.options.is_empty();
+        self.options = options;
+        if was_empty {
+            self.cursor = self.options.iter().position(|i| i.is_current).unwrap_or(0);
+        } else {
+            self.cursor = self.cursor.min(self.options.len().saturating_sub(1));
+        }
+    }
+
     /// Iterations matching the current query, ranked by fuzzy score (matched on
     /// both the short name and full path).
     pub fn matches(&self) -> Vec<&Iteration> {
@@ -96,7 +109,7 @@ impl IterationPicker {
         self.selected.clone()
     }
 
-    pub fn render(&self, f: &mut Frame, area: Rect) {
+    pub fn render(&self, f: &mut Frame, area: Rect, loading: bool, spinner: char) {
         let w = area.width.saturating_sub(area.width / 4).clamp(36, 70).min(area.width);
         let h = area.height.saturating_sub(area.height / 4).clamp(10, 22).min(area.height);
         let rect = Rect {
@@ -145,6 +158,20 @@ impl IterationPicker {
             Paragraph::new(Span::styled("─ iterations ─", Style::default().fg(theme::DIM))),
             rows[2],
         );
+
+        // Nothing to show yet: surface the background fetch instead of a blank box.
+        if self.options.is_empty() {
+            let msg = if loading {
+                Span::styled(
+                    format!("{spinner} fetching iterations…"),
+                    Style::default().fg(Color::Yellow),
+                )
+            } else {
+                Span::styled("no iterations found", Style::default().fg(theme::DIM))
+            };
+            f.render_widget(Paragraph::new(Line::from(msg)), rows[3]);
+            return;
+        }
 
         let matches = self.matches();
         let items: Vec<ListItem> = matches

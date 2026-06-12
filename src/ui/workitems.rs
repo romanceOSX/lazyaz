@@ -16,6 +16,22 @@ fn state_color(s: WorkItemState) -> Color {
     }
 }
 
+/// Right-aligned story-points cell (e.g. `  3 pts`); blank when unset so the
+/// title column still lines up.
+fn points_cell(points: Option<f64>) -> String {
+    match points {
+        Some(p) => {
+            let n = if p.fract().abs() < f64::EPSILON {
+                format!("{}", p as i64)
+            } else {
+                format!("{p:.1}")
+            };
+            format!("{n:>4} pts ")
+        }
+        None => format!("{:>9}", ""),
+    }
+}
+
 pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -48,9 +64,10 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
         .filter_map(|i| app.items.get(*i))
         .map(|w| {
             ListItem::new(Line::from(vec![
-                Span::styled(format!("#{:<5}", w.id), Style::default().fg(theme::DIM)),
+                Span::styled(format!("#{:<7}  ", w.id), Style::default().fg(theme::DIM)),
                 Span::styled(format!("{:<11}", w.item_type), Style::default().fg(Color::Magenta)),
                 Span::styled(format!("{:<9}", w.state_name), Style::default().fg(state_color(w.state))),
+                Span::styled(points_cell(w.story_points), Style::default().fg(Color::Cyan)),
                 Span::raw(w.title.clone()),
             ]))
         })

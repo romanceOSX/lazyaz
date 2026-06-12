@@ -16,6 +16,7 @@ pub mod theme;
 pub mod tree;
 pub mod type_filter;
 pub mod wizard;
+pub mod yank;
 pub mod workitems;
 
 use crate::app::{App, Tab};
@@ -69,13 +70,16 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         tags.render(f, f.area());
     }
     if let Some(picker) = &app.iteration_picker {
-        picker.render(f, f.area());
+        picker.render(f, f.area(), app.iterations_loading(), app.spinner_frame());
     }
     if let Some(dr) = &app.date_range {
         dr.render(f, f.area());
     }
     if let Some(picker) = &app.type_picker {
         picker.render(f, f.area());
+    }
+    if let Some(menu) = &app.yank_menu {
+        menu.render(f, f.area());
     }
     // The resolution-options menu floats above everything else.
     if app.resolution.is_some() {

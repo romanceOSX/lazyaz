@@ -20,7 +20,7 @@ impl Default for MockClient {
 impl MockClient {
     pub fn new() -> Self {
         let me = "you@example.com";
-        let mk = |id, title: &str, item_type: &str, state: WorkItemState, parent, children: Vec<u32>, days, desc: &str, notes: &str, tags: Vec<&str>, dev_links: Vec<DevLink>, comments| WorkItem {
+        let mk = |id, title: &str, item_type: &str, state: WorkItemState, parent, children: Vec<u32>, days, desc: &str, notes: &str, tags: Vec<&str>, dev_links: Vec<DevLink>, comments, story_points: Option<f64>| WorkItem {
             id,
             title: title.into(),
             item_type: item_type.into(),
@@ -37,6 +37,7 @@ impl MockClient {
             description: desc.into(),
             notes: notes.into(),
             tags: tags.into_iter().map(String::from).collect(),
+            story_points,
             parent,
             children,
             dev_links,
@@ -52,18 +53,18 @@ impl MockClient {
         let items = vec![
             mk(1001, "Epic: Terminal-first Azure DevOps workflow", "Epic", WorkItemState::Active, None, vec![1002, 1003], 2,
                 "Umbrella for the lazyaz TUI initiative.", "Stakeholders: DX guild.", vec!["tui", "dx"], vec![],
-                vec![Comment { id: 1, author: "pm@example.com".into(), when: "2d ago".into(), text: "Let's prioritize read flows first.".into() }]),
+                vec![Comment { id: 1, author: "pm@example.com".into(), when: "2d ago".into(), text: "Let's prioritize read flows first.".into() }], None),
             mk(1002, "Browse my assigned user stories from the terminal", "User Story", WorkItemState::Active, Some(1001), vec![1004, 1005], 0,
                 "As a developer I want to list and open my stories.", "Acceptance: filter by timeframe.", vec!["read"],
-                vec![gh("PR #42: list view", "https://github.com/romanceOSX/lazyaz/pull/42")], vec![]),
+                vec![gh("PR #42: list view", "https://github.com/romanceOSX/lazyaz/pull/42")], vec![], Some(8.0)),
             mk(1003, "Edit work items in $EDITOR and sync back", "User Story", WorkItemState::New, Some(1001), vec![], 6,
                 "As a developer I want to edit fields in my editor.", "Watch out for the suspend/restore dance.", vec!["write", "stretch"],
                 vec![gh("commit a1b2c3d", "https://github.com/romanceOSX/lazyaz/commit/a1b2c3d")],
-                vec![Comment { id: 1, author: "you@example.com".into(), when: "6d ago".into(), text: "Needs terminal suspend.".into() }]),
+                vec![Comment { id: 1, author: "you@example.com".into(), when: "6d ago".into(), text: "Needs terminal suspend.".into() }], Some(5.0)),
             mk(1004, "Wire WIQL query for assigned items", "Task", WorkItemState::Active, Some(1002), vec![], 1,
-                "Build the @Me WIQL and map the response.", "", vec![], vec![], vec![]),
+                "Build the @Me WIQL and map the response.", "", vec![], vec![], vec![], None),
             mk(1005, "Render detail pane with comments", "Task", WorkItemState::Closed, Some(1002), vec![], 12,
-                "Lay out fields + comments + relations.", "Done in sprint 23.", vec!["done"], vec![], vec![]),
+                "Lay out fields + comments + relations.", "Done in sprint 23.", vec!["done"], vec![], vec![], None),
         ];
         Self {
             items: Arc::new(Mutex::new(items)),

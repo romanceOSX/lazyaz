@@ -11,6 +11,7 @@ use crate::ui::iteration_picker::IterationPicker;
 use crate::ui::picker::Picker;
 use crate::ui::type_filter::TypeFilter;
 use crate::ui::tags_editor::TagsEditor;
+use crate::ui::yank::{YankKind, YankMenu};
 use ratatui::widgets::ListState;
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender};
@@ -327,6 +328,9 @@ pub struct App {
     pub date_range: Option<DateRangeInput>,
     /// Whether iterations have been loaded & the default-to-current applied.
     pub iterations_initialized: bool,
+    /// True while the team's iterations are being fetched in the background
+    /// (drives the iteration picker's "fetching…" indicator).
+    pub iterations_loading: bool,
 
     /// Work-item types the list is filtered to (empty = no type filter).
     pub item_types: Vec<String>,
@@ -382,6 +386,12 @@ pub struct App {
     pub pending_editor: Option<EditorRequest>,
     /// Seed text for a pending Merge editor request (conflict markers).
     pub merge_seed: Option<String>,
+    /// Floating yank menu (modal), opened with `y` on a focused work item.
+    pub yank_menu: Option<YankMenu>,
+    /// Long-lived system-clipboard handle. Kept alive for the app's lifetime so
+    /// copied text survives on clipboard managers (notably X11) that only serve
+    /// content while the owning process holds the selection.
+    pub clipboard: Option<arboard::Clipboard>,
 
     started: Instant,
     last_poll: Instant,
@@ -415,6 +425,22 @@ pub struct App {
     tree_reroot_focus: Option<u32>,
     /// Move the cursor onto this node once it becomes visible.
     tree_select_after: Option<u32>,
+    /// Subtree roots the user requested a *recursive* expand on (`c`). Newly
+    /// fetched descendants under these roots auto-expand as they arrive, until
+    /// the whole subtree has loaded.
+    tree_expand_all: HashSet<u32>,
+
+    /// HTML tree-report generation runs on a background thread (it may fetch the
+    /// whole subtree); the worker writes the file, opens it, and reports back.
+    report_inflight: bool,
+    report_tx: Sender<ReportOutcome>,
+    report_rx: Receiver<ReportOutcome>,
+}
+
+/// Result of a background HTML tree-report generation.
+enum ReportOutcome {
+    Done { path: String, count: usize },
+    Error { msg: String },
 }
 
 /// Result of a background push of the open item's pending edits.
@@ -483,6 +509,7 @@ impl App {
         let (live_tx, live_rx) = std::sync::mpsc::channel();
         let (push_tx, push_rx) = std::sync::mpsc::channel();
         let (tree_tx, tree_rx) = std::sync::mpsc::channel();
+        let (report_tx, report_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             wizard,
             // Default landing view: the current iteration's work items.
@@ -501,6 +528,7 @@ impl App {
             iteration_picker: None,
             date_range: None,
             iterations_initialized: false,
+            iterations_loading: false,
             item_types: Vec::new(),
             type_picker: None,
             item_types_initialized: false,
@@ -530,6 +558,8 @@ impl App {
             pending_g: false,
             pending_editor: None,
             merge_seed: None,
+            yank_menu: None,
+            clipboard: None,
             started: now,
             last_poll: now,
             loading: false,
@@ -548,6 +578,10 @@ impl App {
             tree_rx,
             tree_reroot_focus: None,
             tree_select_after: None,
+            tree_expand_all: HashSet::new(),
+            report_inflight: false,
+            report_tx,
+            report_rx,
             config,
         };
         if app.wizard.is_none() {
@@ -874,6 +908,9 @@ impl App {
         let tx = self.refresh_tx.clone();
         let filter = self.filter();
         let want_iterations = self.iterations.is_empty();
+        if want_iterations {
+            self.iterations_loading = true;
+        }
         let current_id = self.current.as_ref().map(|w| w.id);
         std::thread::spawn(move || {
             let items = client.list_assigned(&filter).map_err(|e| e.to_string());
@@ -919,6 +956,12 @@ impl App {
             // filter to the current sprint and re-issue the fetch.
             if let Some(iters) = iterations {
                 self.iterations = iters;
+                self.iterations_loading = false;
+                // Live-populate the picker if it's already open and waiting.
+                let opts = self.iterations.clone();
+                if let Some(p) = self.iteration_picker.as_mut() {
+                    p.refresh_options(opts);
+                }
                 if !self.iterations_initialized {
                     self.iterations_initialized = true;
                     if let Some(cur) = self.iterations.iter().find(|i| i.is_current) {
@@ -1121,6 +1164,11 @@ impl App {
         !self.tree_pending.is_empty()
     }
 
+    /// True while an HTML tree report is being generated in the background.
+    pub fn is_reporting(&self) -> bool {
+        self.report_inflight
+    }
+
     /// Request the work items needed to render the current tree (the root plus
     /// the children of every expanded node) on a background thread. Already
     /// cached / in-flight ids are skipped, so this is cheap to call repeatedly.
@@ -1187,6 +1235,14 @@ impl App {
         }
         if changed {
             self.tree_ensure_fetched(); // pull in children newly discovered above
+            // Deepen any recursive expand as descendants arrive; stop tracking
+            // once the whole subtree has finished loading.
+            if !self.tree_expand_all.is_empty() {
+                self.tree_apply_expand_all();
+                if self.tree_pending.is_empty() {
+                    self.tree_expand_all.clear();
+                }
+            }
             self.rebuild_tree();
             // Land the cursor on a deferred target once it becomes visible.
             if let Some(target) = self.tree_select_after
@@ -1210,6 +1266,7 @@ impl App {
         self.tree_cache.clear();
         self.tree_pending.clear();
         self.tree.expanded.clear();
+        self.tree_expand_all.clear();
         self.tree_focus = Some(focus);
         // Show something as soon as the focus loads; re-root onto its parent once
         // we learn it (handled in drain_tree).
@@ -1386,6 +1443,83 @@ impl App {
         }
     }
 
+    /// The full work item the user is currently pointed at, for whichever item
+    /// view is active. In the Tree it comes from the lazily-built cache, which
+    /// may not hold the node yet (still being fetched) — in that case `None`.
+    fn active_item(&self) -> Option<&WorkItem> {
+        match self.context() {
+            Context::Tree => self.tree_selected_id().and_then(|id| self.tree_item(id)),
+            Context::WorkItems => self.selected_item(),
+            Context::Detail => self.current.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// URL prefix such that `{prefix}{id}` is the web URL for any work item.
+    /// `None` when no org is configured. Used by the HTML report to link items.
+    fn work_item_url_prefix(&self) -> Option<String> {
+        let org = self.config.org_url.trim().trim_end_matches('/');
+        if org.is_empty() {
+            return None;
+        }
+        let base = if org.starts_with("http://") || org.starts_with("https://") {
+            org.to_string()
+        } else {
+            format!("https://dev.azure.com/{org}")
+        };
+        let project = self.config.project.trim();
+        if project.is_empty() {
+            Some(format!("{base}/_workitems/edit/"))
+        } else {
+            Some(format!("{base}/{}/_workitems/edit/", project.replace(' ', "%20")))
+        }
+    }
+
+    /// Generate an HTML report of the current tree (the focus subtree) and open
+    /// it in the browser. Runs on a worker thread: it fully fetches the subtree
+    /// (the tree view is lazy, so the cache may be partial) before rendering, so
+    /// the UI never blocks. Picked up by [`drain_report`].
+    fn export_tree_report(&mut self) {
+        if self.report_inflight {
+            self.status = "a report is already being generated…".into();
+            return;
+        }
+        let Some(root) = self.tree_root.or(self.tree_focus) else {
+            self.status = "open a tree first (press v on a work item)".into();
+            return;
+        };
+        let title = self
+            .tree_cache
+            .get(&root)
+            .map(|w| format!("Tree report · #{} {}", w.id, w.title))
+            .unwrap_or_else(|| format!("Tree report · #{root}"));
+        let known = self.tree_cache.clone();
+        let prefix = self.work_item_url_prefix();
+        let client = self.client.clone_box();
+        let tx = self.report_tx.clone();
+        self.report_inflight = true;
+        self.status = "generating tree report…".into();
+        std::thread::spawn(move || {
+            let outcome = build_tree_report(client, root, known, prefix, title);
+            let _ = tx.send(outcome);
+        });
+    }
+
+    /// Apply a completed background report generation. Non-blocking.
+    pub fn drain_report(&mut self) {
+        while let Ok(outcome) = self.report_rx.try_recv() {
+            self.report_inflight = false;
+            match outcome {
+                ReportOutcome::Done { path, count } => {
+                    self.status = format!("report ({count} items) opened: {path}");
+                }
+                ReportOutcome::Error { msg } => {
+                    self.status = format!("report failed: {msg}");
+                }
+            }
+        }
+    }
+
     /// Browser URL for a work item in the Azure DevOps web UI. `org_url` may be
     /// a bare org name or a full URL; the project segment is included when set.
     fn work_item_web_url(&self, id: u32) -> Option<String> {
@@ -1422,6 +1556,81 @@ impl App {
         match open::that(&url) {
             Ok(()) => self.status = format!("opening #{id} in the browser…"),
             Err(e) => self.status = format!("could not open browser: {e}"),
+        }
+    }
+
+    /// Open the yank menu on the focused work item (Work Items / Tree only).
+    fn open_yank_menu(&mut self) {
+        match self.active_item() {
+            Some(item) => {
+                self.yank_menu = Some(YankMenu::new(item.id, item.title.clone()));
+            }
+            None => self.status = "no item selected".into(),
+        }
+    }
+
+    /// Copy text to the system clipboard, reusing a long-lived handle so the
+    /// content survives on clipboard managers that need the owner alive.
+    fn copy_to_clipboard(&mut self, text: String) -> bool {
+        if self.clipboard.is_none() {
+            self.clipboard = arboard::Clipboard::new().ok();
+        }
+        match self.clipboard.as_mut() {
+            Some(cb) => cb.set_text(text).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Render the requested representation of a work item as clipboard text.
+    fn yank_text(&self, item: &WorkItem, kind: YankKind) -> String {
+        match kind {
+            YankKind::Summary => item.title.clone(),
+            YankKind::Number => format!("#{}", item.id),
+            YankKind::Hyperlink => match self.work_item_web_url(item.id) {
+                Some(url) => format!("[#{}: {}]({url})", item.id, item.title),
+                None => format!("#{}: {}", item.id, item.title),
+            },
+            YankKind::Verbose => {
+                let mut s = format!("#{} [{}] {}\n", item.id, item.item_type, item.title);
+                s.push_str(&format!("State: {}\n", item.state_name));
+                if !item.assigned_to.trim().is_empty() {
+                    s.push_str(&format!("Assigned to: {}\n", item.assigned_to));
+                }
+                if !item.iteration.trim().is_empty() {
+                    s.push_str(&format!("Iteration: {}\n", item.iteration));
+                }
+                if !item.tags.is_empty() {
+                    s.push_str(&format!("Tags: {}\n", item.tags.join(", ")));
+                }
+                if let Some(url) = self.work_item_web_url(item.id) {
+                    s.push_str(&format!("URL: {url}\n"));
+                }
+                if !item.description.trim().is_empty() {
+                    s.push_str(&format!("\n{}\n", item.description.trim()));
+                }
+                s
+            }
+        }
+    }
+
+    /// Copy the focused work item's chosen representation to the clipboard.
+    pub fn yank(&mut self, kind: YankKind) {
+        let Some(item) = self.active_item() else {
+            self.status = "no item selected".into();
+            return;
+        };
+        let id = item.id;
+        let text = self.yank_text(item, kind);
+        let label = match kind {
+            YankKind::Summary => "summary",
+            YankKind::Hyperlink => "hyperlink",
+            YankKind::Number => "number",
+            YankKind::Verbose => "details",
+        };
+        if self.copy_to_clipboard(text) {
+            self.status = format!("yanked #{id} {label} to clipboard");
+        } else {
+            self.status = "could not access the system clipboard".into();
         }
     }
 
@@ -1471,6 +1680,7 @@ impl App {
             Action::OpenTimeframeFilter => {
                 self.date_range = Some(DateRangeInput::new(self.timeframe));
             }
+            Action::ClearTimeFilter => self.clear_time_filter(),
             Action::Open => self.open(),
             Action::Back => self.tab = Tab::WorkItems,
             Action::ViewInTree => self.view_in_tree(),
@@ -1482,6 +1692,8 @@ impl App {
             Action::TreePrevSibling => self.tree_sibling(-1),
             Action::TreeLevelIn => self.tree_level_in(),
             Action::TreeLevelOut => self.tree_level_out(),
+            Action::TreeToggleRecursive => self.tree_toggle_recursive(),
+            Action::ExportTreeReport => self.export_tree_report(),
             Action::RefreshTree => self.refresh_tree(),
             Action::Edit => self.request_field_edit("description"),
             Action::EditNotes => self.request_field_edit("notes"),
@@ -1494,6 +1706,7 @@ impl App {
             Action::DeleteComment => self.request_comment_delete(),
             Action::Push => self.push_pending(),
             Action::OpenInBrowser => self.open_in_browser(),
+            Action::OpenYankMenu => self.open_yank_menu(),
             Action::ResolveMerge => self.resolve_merge(),
             Action::ResolveForce => self.resolve_force(),
             Action::EditField => self.begin_config_edit(),
@@ -1518,6 +1731,86 @@ impl App {
             }
             self.rebuild_tree();
         }
+    }
+
+    /// Ids of the selected node and every cached descendant (DFS over the
+    /// children stored in `tree_cache`). Nodes not yet fetched are skipped.
+    fn tree_subtree_ids(&self, root: u32) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            out.push(id);
+            if let Some(item) = self.tree_cache.get(&id) {
+                for c in &item.children {
+                    stack.push(*c);
+                }
+            }
+        }
+        out
+    }
+
+    /// Mark every node in each requested subtree (that has children) as
+    /// expanded and fetch the next level. Called repeatedly as descendants
+    /// arrive so a recursive expand deepens progressively.
+    fn tree_apply_expand_all(&mut self) {
+        let roots: Vec<u32> = self.tree_expand_all.iter().copied().collect();
+        for root in roots {
+            for id in self.tree_subtree_ids(root) {
+                // Expand any node that has (or might still load) children. An
+                // uncached node is assumed to possibly have children so it gets
+                // expanded once fetched.
+                let has_children = self
+                    .tree_cache
+                    .get(&id)
+                    .is_none_or(|w| !w.children.is_empty());
+                if has_children {
+                    self.tree.expanded.insert(id);
+                }
+            }
+        }
+        self.tree_ensure_fetched();
+    }
+
+    /// True when every cached node-with-children in the subtree under `root` is
+    /// already expanded and nothing is still loading — i.e. the whole subtree is
+    /// fully unfolded.
+    fn tree_subtree_fully_expanded(&self, root: u32) -> bool {
+        if !self.tree_pending.is_empty() {
+            return false;
+        }
+        self.tree_subtree_ids(root).into_iter().all(|id| {
+            match self.tree_cache.get(&id) {
+                Some(item) if !item.children.is_empty() => self.tree.expanded.contains(&id),
+                _ => true,
+            }
+        })
+    }
+
+    /// `c`: recursively collapse or expand the whole subtree under the cursor.
+    /// If the subtree is already fully unfolded it collapses everything (the
+    /// node and all descendants); otherwise it expands the whole subtree,
+    /// fetching deeper levels as needed.
+    fn tree_toggle_recursive(&mut self) {
+        let Some(id) = self.tree_selected_id() else {
+            return;
+        };
+        if !self.tree_has_children(id) {
+            return;
+        }
+        if self.tree_subtree_fully_expanded(id) {
+            // Collapse the node and clear the expanded/auto-expand state of every
+            // descendant so re-opening starts fully collapsed.
+            for d in self.tree_subtree_ids(id) {
+                self.tree.expanded.remove(&d);
+                self.tree_expand_all.remove(&d);
+            }
+            self.status = format!("collapsed #{id} and its descendants");
+        } else {
+            self.tree_expand_all.insert(id);
+            self.tree_apply_expand_all();
+            self.status = format!("expanding #{id} and its descendants…");
+        }
+        self.rebuild_tree();
     }
 
     /// `(id, depth)` of the currently selected tree node, if any.
@@ -2020,6 +2313,16 @@ impl App {
             self.iterations.clone(),
             self.selected_iterations.clone(),
         ));
+        // If we don't have the iterations yet, kick off a fetch so the picker
+        // fills in (with a "fetching…" indicator) instead of staying empty.
+        if self.iterations.is_empty() && !self.loading {
+            self.request_refresh();
+        }
+    }
+
+    /// True while the team's iterations are being fetched in the background.
+    pub fn iterations_loading(&self) -> bool {
+        self.iterations_loading
     }
 
     /// Iteration-based and timeframe-based filtering are mutually exclusive.
@@ -2046,6 +2349,22 @@ impl App {
 
     pub fn iteration_picker_cancel(&mut self) {
         self.iteration_picker = None;
+    }
+
+    /// Clear any active time filter — both the timeframe (date-range) window
+    /// and the iteration selection — returning to the neutral "all time" view.
+    /// The two are mutually exclusive, so at most one is ever active, but we
+    /// reset both unconditionally so a single key always lands on a clean state.
+    pub fn clear_time_filter(&mut self) {
+        let had_filter = !self.timeframe.is_empty() || !self.selected_iterations.is_empty();
+        self.timeframe = Timeframe::default();
+        self.selected_iterations.clear();
+        if had_filter {
+            self.status = "cleared time filter".into();
+            self.request_refresh();
+        } else {
+            self.status = "no time filter active".into();
+        }
     }
 
     pub fn open_type_picker(&mut self) {
@@ -2541,6 +2860,56 @@ fn run_push(
     PushOutcome::Done { id, total, failed }
 }
 
+/// Worker body for a background HTML tree report. Fully fetches the subtree
+/// rooted at `root` (the tree view is lazy, so `known` may be partial), renders
+/// a self-contained HTML document, writes it to a temp file, and opens it. Runs
+/// entirely off the UI thread.
+fn build_tree_report(
+    client: Box<dyn WorkItemClient + Send + Sync>,
+    root: u32,
+    mut cache: HashMap<u32, WorkItem>,
+    prefix: Option<String>,
+    title: String,
+) -> ReportOutcome {
+    // BFS the subtree, fetching any node we don't already have cached.
+    let mut queue = vec![root];
+    let mut seen = HashSet::new();
+    while let Some(id) = queue.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let item = match cache.get(&id) {
+            Some(w) => w.clone(),
+            None => match client.get(id) {
+                Ok(w) => {
+                    cache.insert(id, w.clone());
+                    w
+                }
+                Err(_) => continue,
+            },
+        };
+        queue.extend(item.children.iter().copied());
+    }
+
+    let html = crate::report::render_tree_html(root, &cache, &title, prefix.as_deref());
+    let mut path = std::env::temp_dir();
+    path.push(format!("lazyaz-tree-{root}.html"));
+    if let Err(e) = std::fs::write(&path, html.as_bytes()) {
+        return ReportOutcome::Error {
+            msg: format!("writing {}: {e}", path.display()),
+        };
+    }
+    if let Err(e) = open::that(&path) {
+        return ReportOutcome::Error {
+            msg: format!("opening {}: {e}", path.display()),
+        };
+    }
+    ReportOutcome::Done {
+        path: path.display().to_string(),
+        count: seen.len(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2712,6 +3081,46 @@ mod tests {
     }
 
     #[test]
+    fn tree_recursive_expand_loads_all_descendants() {
+        let mut app = ready_app();
+        app.load_tree_for(1001); // Epic → Stories (1002, 1003) shown…
+        app.settle_tree();
+        // …grandchildren under 1002 are not loaded by a single-level expand.
+        assert!(!tree_node_ids(&app).contains(&1004));
+        // Recursive expand on the epic pulls in every descendant level.
+        app.tree.selected = tree_node_row(&app, 1001);
+        app.apply(Action::TreeToggleRecursive);
+        app.settle_tree();
+        assert!(tree_node_ids(&app).contains(&1004), "grandchild loaded");
+        assert!(tree_node_ids(&app).contains(&1005), "grandchild loaded");
+    }
+
+    #[test]
+    fn tree_recursive_collapse_hides_whole_subtree() {
+        let mut app = ready_app();
+        app.load_tree_for(1001);
+        app.settle_tree();
+        // Fully expand the subtree first.
+        app.tree.selected = tree_node_row(&app, 1001);
+        app.apply(Action::TreeToggleRecursive);
+        app.settle_tree();
+        assert!(tree_node_ids(&app).contains(&1004));
+        // Toggling again on the epic collapses the entire subtree.
+        app.tree.selected = tree_node_row(&app, 1001);
+        app.apply(Action::TreeToggleRecursive);
+        let ids = tree_node_ids(&app);
+        assert!(!ids.contains(&1002), "child hidden");
+        assert!(!ids.contains(&1004), "grandchild hidden");
+        // Descendants are reset to collapsed: re-opening the epic one level
+        // shows children, but not grandchildren.
+        app.tree.selected = tree_node_row(&app, 1001);
+        app.apply(Action::TreeExpand);
+        app.settle_tree();
+        assert!(tree_node_ids(&app).contains(&1002), "child shown again");
+        assert!(!tree_node_ids(&app).contains(&1004), "grandchild stays collapsed");
+    }
+
+    #[test]
     fn tree_flattens_and_collapses() {
         let mut app = ready_app();
         app.load_tree_for(1001); // anchor the tree on the epic
@@ -2863,6 +3272,23 @@ mod tests {
     }
 
     #[test]
+    fn clear_time_filter_resets_both_filters() {
+        use crate::api::models::Date;
+        let mut app = ready_app();
+        // With an active timeframe window, clearing returns to the neutral state.
+        app.set_timeframe(Timeframe { from: Some(Date::today()), to: None });
+        app.clear_time_filter();
+        assert!(app.timeframe.is_empty(), "timeframe cleared");
+        assert!(app.selected_iterations.is_empty(), "iterations cleared");
+
+        // With an active iteration selection, clearing also resets it.
+        app.selected_iterations = vec!["Proj\\Sprint 24".into()];
+        app.clear_time_filter();
+        assert!(app.selected_iterations.is_empty(), "iteration selection cleared");
+        assert!(app.timeframe.is_empty(), "timeframe still empty");
+    }
+
+    #[test]
     fn tree_is_independent_of_timeframe_filter() {
         use crate::api::models::Date;
         let mut app = ready_app();
@@ -2917,6 +3343,46 @@ mod tests {
         // No org configured → no URL.
         app.config.org_url = "".into();
         assert!(app.work_item_web_url(1).is_none());
+    }
+
+    #[test]
+    fn yank_text_renders_each_kind() {
+        use crate::api::models::WorkItemState;
+        let app = ready_app();
+        let item = WorkItem {
+            id: 42,
+            title: "Fix the login bug".into(),
+            item_type: "Bug".into(),
+            state: WorkItemState::Active,
+            state_name: "Active".into(),
+            available_states: vec![],
+            assigned_to: "Ada Lovelace".into(),
+            iteration: "Sprint 7".into(),
+            description: "Users cannot log in.".into(),
+            notes: String::new(),
+            tags: vec!["urgent".into(), "auth".into()],
+            story_points: Some(3.0),
+            parent: None,
+            children: vec![],
+            dev_links: vec![],
+            comments: vec![],
+            changed_days_ago: 0,
+            rev: 1,
+        };
+        assert_eq!(app.yank_text(&item, YankKind::Summary), "Fix the login bug");
+        assert_eq!(app.yank_text(&item, YankKind::Number), "#42");
+        assert_eq!(
+            app.yank_text(&item, YankKind::Hyperlink),
+            "[#42: Fix the login bug](https://dev.azure.com/acme/Widgets/_workitems/edit/42)"
+        );
+        let verbose = app.yank_text(&item, YankKind::Verbose);
+        assert!(verbose.starts_with("#42 [Bug] Fix the login bug\n"));
+        assert!(verbose.contains("State: Active\n"));
+        assert!(verbose.contains("Assigned to: Ada Lovelace\n"));
+        assert!(verbose.contains("Iteration: Sprint 7\n"));
+        assert!(verbose.contains("Tags: urgent, auth\n"));
+        assert!(verbose.contains("URL: https://dev.azure.com/acme/Widgets/_workitems/edit/42\n"));
+        assert!(verbose.contains("Users cannot log in."));
     }
 
     #[test]
@@ -3249,6 +3715,28 @@ mod tests {
         assert_eq!(app.context(), Context::IterationFilter);
         app.iteration_picker_cancel();
         assert_ne!(app.context(), Context::IterationFilter);
+    }
+
+    #[test]
+    fn iteration_picker_shows_loading_then_populates_live() {
+        let mut app = ready_app();
+        // Start with no iterations loaded (as on a fresh boot).
+        app.iterations.clear();
+        app.iterations_initialized = false;
+        // Opening the picker shows it empty and kicks off a background fetch.
+        app.open_iteration_picker();
+        assert!(app.iteration_picker.as_ref().unwrap().options.is_empty());
+        assert!(
+            app.iterations_loading(),
+            "should report fetching while iterations load"
+        );
+        // Once the background fetch completes, the still-open picker fills in.
+        app.settle();
+        assert!(!app.iterations_loading());
+        assert!(
+            !app.iteration_picker.as_ref().unwrap().options.is_empty(),
+            "picker should populate live without reopening"
+        );
     }
 
     #[test]

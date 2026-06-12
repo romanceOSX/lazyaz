@@ -97,6 +97,9 @@ pub struct WorkItem {
     /// Free-form notes (separate from description), editable in the detail view.
     pub notes: String,
     pub tags: Vec<String>,
+    /// Story points / effort estimate, when the work item carries one
+    /// (`Microsoft.VSTS.Scheduling.StoryPoints`, falling back to `…Effort`).
+    pub story_points: Option<f64>,
     pub parent: Option<u32>,
     pub children: Vec<u32>,
     /// "Development" links: pull requests, commits, branches, external URLs.

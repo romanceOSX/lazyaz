@@ -392,6 +392,12 @@ fn field_str(fields: &Value, key: &str) -> String {
     fields[key].as_str().unwrap_or("").to_string()
 }
 
+/// A numeric field. Azure may send it as a JSON number or a numeric string.
+fn field_f64(fields: &Value, key: &str) -> Option<f64> {
+    let v = &fields[key];
+    v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}
+
 /// `System.AssignedTo` is either a string or an identity object.
 fn identity(fields: &Value, key: &str) -> String {
     let v = &fields[key];
@@ -469,6 +475,8 @@ fn parse_work_item(v: &Value, notes_field: &str) -> WorkItem {
         description: strip_html(&field_str(fields, "System.Description")),
         notes: strip_html(&field_str(fields, notes_field)),
         tags,
+        story_points: field_f64(fields, "Microsoft.VSTS.Scheduling.StoryPoints")
+            .or_else(|| field_f64(fields, "Microsoft.VSTS.Scheduling.Effort")),
         parent,
         children,
         dev_links,

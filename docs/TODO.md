@@ -84,6 +84,10 @@ What would be an ergonomic way of achieving this within the TUI?
       timeframe to the neutral `All`, and selecting any timeframe window (preset
       or custom) clears the iteration selection. The status bar shows a single
       time chip reflecting whichever is active.
+- [x] **Clear any time filter.** `F` (Work Items / Tree panes) clears whichever
+      time filter is active — both the timeframe window and the iteration
+      selection — returning the list to the neutral "all time" view and
+      triggering a refresh.
 - [x] **Filter by item type.** `t` (Work Items pane) opens a floating fuzzy
       multi-select of the work-item types (Task / User Story / Feature /
       Capability / Epic); Space/Enter toggles, Tab applies, Esc cancels.
@@ -186,8 +190,15 @@ Implementation notes:
   connected component. Anchored on a focus item (`v`), it shows the parent (one
   up), the focus + its siblings (current level), and the focus's children (one
   down). Deeper levels load only when you expand a node (`l`), which fetches just
-  that node's direct children. A collapsed node with children shows `▸`
-  (continues down); a `⋯` row at the top means there are more ancestors above.
+  that node's direct children.
+- **Tree-style rendering.** Rows are drawn with box-drawing connectors
+  (`├─`, `└─`, `│`) like `tree(1)`/`cargo tree` rather than plain indentation, so
+  the hierarchy reads as a tree rather than a file explorer. Expandable nodes
+  carry a chevron (`▸` collapsed / `▾` expanded); leaves have none. The connector
+  prefix is computed purely from the visible rows' depth sequence
+  (`connector_prefix` in `src/ui/tree.rs`), so it stays correct under
+  fuzzy-filtering. A collapsed node with children shows `▸` (continues down); a
+  `⋯` row at the top means there are more ancestors above.
 - **Cache + refresh.** Fetched items live in `App::tree_cache` and are reused as
   you walk. `r` (in the Tree pane) re-fetches the current tree from scratch.
 - Files: `App::{tree_cache,tree_focus,tree_root}`, `TreeRow`,
@@ -265,4 +276,76 @@ jhanges or maintaing any code, this is a Proof of Concept
 - Files: `App::{list_filter,tree_filter}` + `FuzzyFilter` in `src/app.rs`;
   `ui::fuzzy::matches`, `src/ui/search.rs` (search-bar rendering); routed in
   `src/event.rs` (`handle_search`, `/`, Esc) and shown in `workitems.rs`/`tree.rs`.
+
+
+## Yank (clipboard)
+- [x] Status: implemented
+
+- [x] **`y` opens a yank menu** when a work item is focused in the Work Items or
+      Tree window. The second keystroke selects what to copy to the system
+      clipboard:
+      - `yy` → summary (the item's title)
+      - `yl` → hyperlink (markdown link `[#id: title](url)`)
+      - `yn` → number (`#id`)
+      - `yv` → verbose (multi-line dump: id/type/title, state, assignee,
+        iteration, tags, URL, description)
+      Esc cancels; more entries can be added to `YANK_ENTRIES`.
+- Files: `src/ui/yank.rs` (menu + `YankKind`/`YANK_ENTRIES`); `App::{open_yank_menu,
+  yank,yank_text,copy_to_clipboard}` and `App::{yank_menu,clipboard}` in
+  `src/app.rs`; routed in `src/event.rs` (`handle_yank`, `y`); `Action::OpenYankMenu`
+  and bindings in `src/keys.rs`. The clipboard handle is kept alive for the app's
+  lifetime so copied text survives on X11.
+
+## Tree: recursive collapse/expand
+- [x] Status: implemented
+
+- [x] **`c` recursively collapses/expands the subtree under the cursor** in the
+      Tree window. If the whole subtree is already unfolded it collapses the node
+      and every descendant (and resets their state so re-opening starts fully
+      collapsed); otherwise it expands the entire subtree, lazily fetching deeper
+      levels as they arrive.
+- Files: `App::{tree_toggle_recursive,tree_apply_expand_all,tree_subtree_ids,
+  tree_subtree_fully_expanded}` + `App::tree_expand_all` in `src/app.rs` (deepened
+  progressively in `drain_tree`); `Action::TreeToggleRecursive` + binding in
+  `src/keys.rs`; routed in `src/event.rs` (`c` in Tree context).
+
+## Tree: HTML report export
+- [x] Status: implemented
+
+- [x] **`R` exports a self-contained HTML report** of the current tree (the focus
+      subtree) and opens it in the browser. The report has two views:
+      - a **collapsible nested hierarchy** (`<details>`/`<ul>`, works fully
+        offline; item ids link out to the ADO web UI when an org is configured), and
+      - an embedded **Mermaid dependency graph** (parent → child edges, loaded
+        from a CDN).
+      Because the Tree view is lazy, the whole subtree is fetched on a background
+      worker first (no UI block), then the file is written to the OS temp dir
+      (`lazyaz-tree-<root>.html`) and opened.
+- [x] **Story-points statistics** in the report: total points, a done/active/to-do
+      burn-down bar (by state category), an estimated-vs-total count, and a
+      per-item-type breakdown table. Each node also shows a `N pts` badge. Backed
+      by a new `WorkItem.story_points` field parsed from
+      `Microsoft.VSTS.Scheduling.StoryPoints` (falling back to `…Effort`).
+- Approach notes: chose a hand-built static HTML string (zero new crates; reuses
+  the existing `open` crate) over a templating crate or Graphviz/`dot` (external
+  tool). Mermaid gives a real dependency *graph* with no build step.
+- Files: `src/report.rs` (`render_tree_html` + HTML/Mermaid escaping, unit-tested);
+  `App::{export_tree_report,drain_report,work_item_url_prefix,is_reporting}` and the
+  `ReportOutcome` channel + `build_tree_report` worker in `src/app.rs`;
+  `Action::ExportTreeReport` + binding in `src/keys.rs`; routed in `src/event.rs`
+  (`R` in Tree context); `drain_report` in the `src/main.rs` run loop.
+
+## Pending Details
+- [x] **Iteration picker shows a "fetching…" state and populates live.** Opening
+   the iteration filter (`i`) before the team's iterations have loaded now shows
+   a `⠹ fetching iterations…` spinner instead of an empty box, and kicks off the
+   background fetch if one isn't already running. When the fetch completes the
+   *already-open* picker fills in live (no need to reopen). Backed by
+   `App::iterations_loading` (set in `request_refresh`, cleared in `drain_refresh`,
+   which also calls `IterationPicker::refresh_options`).
+   - Note: `client.list_iterations()` returns the sprints in a single batch, so
+     they appear all at once when that call returns rather than one-by-one. True
+     per-item streaming would need a streaming variant of the API call; deferred.
+- [ ] enhance the report
+
 

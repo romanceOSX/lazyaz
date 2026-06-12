@@ -4,6 +4,7 @@ mod auth;
 mod config;
 mod event;
 mod keys;
+mod report;
 mod session;
 mod ui;
 
@@ -137,6 +138,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
             || app.is_loading()
             || app.is_pushing()
             || app.tree_loading()
+            || app.is_reporting()
         {
             Duration::from_millis(120)
         } else {
@@ -153,6 +155,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
         app.drain_live();
         app.drain_push();
         app.drain_tree();
+        app.drain_report();
     }
     Ok(())
 }

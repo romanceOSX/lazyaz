@@ -41,6 +41,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         handle_type_picker(app, key);
         return;
     }
+    if app.yank_menu.is_some() {
+        handle_yank(app, key);
+        return;
+    }
     // 3. Floating field editor is modal.
     if app.info_editor.is_some() {
         handle_info_editor(app, key);
@@ -132,6 +136,22 @@ fn handle_type_picker(app: &mut App, key: KeyEvent) {
             Some(false) => app.type_picker_cancel(),
             None => {}
         }
+    }
+}
+
+/// Keys while the yank menu is open: the second `y…` keystroke selects what to
+/// copy; Esc cancels; any other key closes the menu without copying.
+fn handle_yank(app: &mut App, key: KeyEvent) {
+    use crate::ui::yank::YankMenu;
+    match key.code {
+        KeyCode::Esc => app.yank_menu = None,
+        KeyCode::Char(c) => {
+            if let Some(kind) = YankMenu::kind_for(c) {
+                app.yank(kind);
+            }
+            app.yank_menu = None;
+        }
+        _ => {}
     }
 }
 
@@ -293,11 +313,16 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
 
         // Work-items context
         KeyCode::Char('f') if ctx == Context::WorkItems => app.apply(Action::OpenTimeframeFilter),
+        KeyCode::Char('F') if matches!(ctx, Context::WorkItems | Context::Tree) => {
+            app.apply(Action::ClearTimeFilter)
+        }
         KeyCode::Char('r') if ctx == Context::WorkItems => app.apply(Action::Reload),
         KeyCode::Char('r') if ctx == Context::Tree => app.apply(Action::RefreshTree),
         // Tree: J/K move between siblings, H/L move between levels (in/out).
         KeyCode::Char('J') if ctx == Context::Tree => app.apply(Action::TreeNextSibling),
         KeyCode::Char('K') if ctx == Context::Tree => app.apply(Action::TreePrevSibling),
+        KeyCode::Char('c') if ctx == Context::Tree => app.apply(Action::TreeToggleRecursive),
+        KeyCode::Char('R') if ctx == Context::Tree => app.apply(Action::ExportTreeReport),
         KeyCode::Char('L') if ctx == Context::Tree => app.apply(Action::TreeLevelIn),
         KeyCode::Char('H') if ctx == Context::Tree => app.apply(Action::TreeLevelOut),
         KeyCode::Char('v') if ctx == Context::WorkItems => app.apply(Action::ViewInTree),
@@ -308,6 +333,10 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('t') if ctx == Context::WorkItems => {
             app.apply(Action::OpenTypeFilter)
+        }
+        // Yank menu: copy the focused work item's details to the clipboard.
+        KeyCode::Char('y') if matches!(ctx, Context::WorkItems | Context::Tree) => {
+            app.apply(Action::OpenYankMenu)
         }
 
         // Detail context
