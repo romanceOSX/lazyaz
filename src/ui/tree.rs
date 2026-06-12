@@ -5,13 +5,28 @@
 
 use crate::app::{App, TreeRow};
 use crate::ui::theme;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
+    // Reserve a top line for the fuzzy search bar when it's in use.
+    let area = if app.tree_filter.active() || app.tree_filter.searching() {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(area);
+        f.render_widget(
+            Paragraph::new(crate::ui::search::line(&app.tree_filter)),
+            rows[0],
+        );
+        rows[1]
+    } else {
+        area
+    };
+
     let items: Vec<ListItem> = app
         .tree
         .flat

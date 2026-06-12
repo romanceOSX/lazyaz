@@ -22,21 +22,30 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
         .constraints([Constraint::Length(1), Constraint::Min(1)])
         .split(area);
 
-    // Filter hint row: the active time filter plus how to change the filters.
-    let spans = vec![
-        Span::styled("filter ", theme::label()),
-        Span::styled(app.time_filter_label(), Style::default().fg(Color::Magenta)),
-        Span::styled(
-            "   f timeframe · i iteration · t type",
-            Style::default().fg(theme::DIM),
-        ),
-    ];
-    f.render_widget(Paragraph::new(Line::from(spans)), rows[0]);
+    // Top row: the fuzzy search bar when a filter is active, else the filter
+    // hint (active time filter + how to change the filters).
+    if app.list_filter.active() || app.list_filter.searching() {
+        f.render_widget(
+            Paragraph::new(crate::ui::search::line(&app.list_filter)),
+            rows[0],
+        );
+    } else {
+        let spans = vec![
+            Span::styled("filter ", theme::label()),
+            Span::styled(app.time_filter_label(), Style::default().fg(Color::Magenta)),
+            Span::styled(
+                "   / find · f timeframe · i iteration · t type",
+                Style::default().fg(theme::DIM),
+            ),
+        ];
+        f.render_widget(Paragraph::new(Line::from(spans)), rows[0]);
+    }
 
-    // List.
-    let items: Vec<ListItem> = app
-        .items
+    // List, narrowed to the fuzzy-filtered items.
+    let visible = app.visible_item_indices();
+    let items: Vec<ListItem> = visible
         .iter()
+        .filter_map(|i| app.items.get(*i))
         .map(|w| {
             ListItem::new(Line::from(vec![
                 Span::styled(format!("#{:<5}", w.id), Style::default().fg(theme::DIM)),
@@ -47,11 +56,16 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
+    let title = if app.list_filter.active() {
+        format!(" Assigned to me ({}/{}) ", visible.len(), app.items.len())
+    } else {
+        " Assigned to me ".to_string()
+    };
     let list = List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Assigned to me ")
+                .title(title)
                 .border_style(Style::default().fg(theme::DIM)),
         )
         .highlight_style(theme::selected_row())

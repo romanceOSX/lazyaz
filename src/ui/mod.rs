@@ -9,6 +9,7 @@ pub mod input;
 pub mod iteration_picker;
 pub mod picker;
 pub mod resolution;
+pub mod search;
 pub mod tabs;
 pub mod tags_editor;
 pub mod theme;

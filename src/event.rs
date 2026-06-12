@@ -218,7 +218,25 @@ fn handle_insert(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Keys while the in-pane fuzzy search bar is open: Enter commits the query as a
+/// tag, Esc closes the bar, Backspace on an empty input deletes the last tag,
+/// everything else edits the live query (live-filtering as you type).
+fn handle_search(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Enter => app.search_commit(),
+        KeyCode::Esc => app.search_cancel(),
+        KeyCode::Backspace if app.search_input_empty() => app.search_pop_tag(),
+        _ => app.search_handle(key),
+    }
+}
+
 fn handle_normal(app: &mut App, key: KeyEvent) {
+    // The in-pane fuzzy search bar (`/`) captures all keys while open.
+    if app.filter_searching() {
+        handle_search(app, key);
+        return;
+    }
+
     // Multi-key `g` sequences.
     if app.pending_g {
         app.pending_g = false;
@@ -232,6 +250,16 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
 
     let ctx = app.context();
     match key.code {
+        // Open the fuzzy filter in the Work Items / Tree panes.
+        KeyCode::Char('/') if matches!(ctx, Context::WorkItems | Context::Tree) => {
+            app.open_search()
+        }
+        // Esc clears an active filter in those panes.
+        KeyCode::Esc
+            if matches!(ctx, Context::WorkItems | Context::Tree) && app.filter_active() =>
+        {
+            app.clear_filter()
+        }
         KeyCode::Char('q') => app.apply(Action::Quit),
         KeyCode::Char('?') => app.apply(Action::ToggleHelp),
         KeyCode::Char('g') => app.pending_g = true,

@@ -34,3 +34,11 @@ where
     scored.sort_by_key(|(s, _)| std::cmp::Reverse(*s));
     scored.into_iter().map(|(_, it)| it).collect()
 }
+
+/// True if `hay` fuzzy-matches `query` (whitespace-only query matches anything).
+pub fn matches(hay: &str, query: &str) -> bool {
+    if query.trim().is_empty() {
+        return true;
+    }
+    SkimMatcherV2::default().fuzzy_match(hay, query).is_some()
+}

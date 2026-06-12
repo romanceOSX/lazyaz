@@ -250,10 +250,19 @@ jhanges or maintaing any code, this is a Proof of Concept
     PoC.
 
 ## Fuzzy finder
-- [] Status: implemented
+- [x] Status: implemented
 
-- [ ] We should be able to 'fuzzy filer' the items in any window, though as for an initial approach this
-   should only apply to the 'Work-Items' and 'Tree-View' windows, by hitting '/' we should be able to 
-   spawn in a 'fzf-style filter' and query any item that contains our request in the
-   current window
+- [x] **`/` opens an fzf-style filter** in the Work Items and Tree panes. Typing
+      live-narrows the pane to items whose `#id / type / title / tags` haystack
+      fuzzy-matches the query. In Work Items the list narrows (with a `n/total`
+      count in the title); in the Tree, matching nodes are kept along with their
+      ancestor path so they stay located in the hierarchy.
+- [x] **Queries show as tag chips in a search bar** at the top of the pane.
+      Enter commits the current query as a chip (and you can add more — they AND
+      together); Backspace on an empty input deletes the last chip; **Esc clears
+      all filters** (or closes the bar without committing). The search bar shows
+      the chips + the live input.
+- Files: `App::{list_filter,tree_filter}` + `FuzzyFilter` in `src/app.rs`;
+  `ui::fuzzy::matches`, `src/ui/search.rs` (search-bar rendering); routed in
+  `src/event.rs` (`handle_search`, `/`, Esc) and shown in `workitems.rs`/`tree.rs`.
 

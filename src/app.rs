@@ -232,6 +232,76 @@ pub struct TreeState {
     pub flat: Vec<TreeRow>,
 }
 
+/// An in-pane fzf-style filter: a set of committed query "tags" (all of which
+/// must match) plus a live input while the user is typing a new one. Opened
+/// with `/` in the Work Items and Tree panes.
+#[derive(Default)]
+pub struct FuzzyFilter {
+    pub tags: Vec<String>,
+    /// `Some` while the search bar is capturing input.
+    pub input: Option<TextInput>,
+}
+
+impl FuzzyFilter {
+    /// True while the search bar is open and capturing keys.
+    pub fn searching(&self) -> bool {
+        self.input.is_some()
+    }
+
+    /// True if anything is filtering the list (a committed tag or live input).
+    pub fn active(&self) -> bool {
+        !self.tags.is_empty()
+            || self
+                .input
+                .as_ref()
+                .is_some_and(|i| !i.value().trim().is_empty())
+    }
+
+    /// All query terms in effect: committed tags plus the live input.
+    fn terms(&self) -> Vec<String> {
+        let mut t = self.tags.clone();
+        if let Some(inp) = &self.input {
+            let v = inp.value();
+            if !v.trim().is_empty() {
+                t.push(v);
+            }
+        }
+        t
+    }
+
+    /// True if `hay` fuzzy-matches every active term (AND semantics).
+    pub fn matches(&self, hay: &str) -> bool {
+        self.terms()
+            .iter()
+            .all(|term| crate::ui::fuzzy::matches(hay, term))
+    }
+
+    fn open(&mut self) {
+        if self.input.is_none() {
+            self.input = Some(TextInput::default());
+        }
+    }
+
+    /// Commit the live input as a tag and close the search bar.
+    fn commit(&mut self) {
+        if let Some(inp) = &self.input {
+            let v = inp.value().trim().to_string();
+            if !v.is_empty() {
+                self.tags.push(v);
+            }
+        }
+        self.input = None;
+    }
+
+    fn cancel(&mut self) {
+        self.input = None;
+    }
+
+    fn input_is_empty(&self) -> bool {
+        self.input.as_ref().is_none_or(|i| i.value().is_empty())
+    }
+}
+
 pub struct App {
     pub config: Config,
     pub tab: Tab,
@@ -244,6 +314,8 @@ pub struct App {
 
     pub items: Vec<WorkItem>,
     pub list_state: ListState,
+    /// In-pane fuzzy filter for the Work Items list (`/`).
+    pub list_filter: FuzzyFilter,
     pub timeframe: Timeframe,
     /// Available iterations (sprints) for the configured team, fetched lazily.
     pub iterations: Vec<Iteration>,
@@ -264,6 +336,8 @@ pub struct App {
     pub item_types_initialized: bool,
 
     pub tree: TreeState,
+    /// In-pane fuzzy filter for the Tree view (`/`).
+    pub tree_filter: FuzzyFilter,
     /// The tree's lazily-built cache of work items (fetched directly via the
     /// client, so it is independent of the timeframe / iteration / type
     /// filters). Walking the tree fetches one nest level at a time.
@@ -420,6 +494,7 @@ impl App {
             auth,
             items: Vec::new(),
             list_state: ListState::default(),
+            list_filter: FuzzyFilter::default(),
             timeframe: Timeframe::default(),
             iterations: Vec::new(),
             selected_iterations: Vec::new(),
@@ -430,6 +505,7 @@ impl App {
             type_picker: None,
             item_types_initialized: false,
             tree: TreeState::default(),
+            tree_filter: FuzzyFilter::default(),
             tree_cache: HashMap::new(),
             tree_focus: None,
             tree_root: None,
@@ -654,11 +730,134 @@ impl App {
         // The relationship tree is intentionally NOT rebuilt here: it is scoped
         // to a focus item and independent of the (timeframe/iteration/type)
         // filter that produced this list.
+        self.clamp_list_selection();
         self.status = format!(
             "{} item(s) · timeframe: {}",
             self.items.len(),
             self.timeframe.label()
         );
+    }
+
+    // --- in-pane fuzzy filter (`/`) ---
+
+    /// Haystack string a work item is fuzzy-matched against.
+    fn item_haystack(w: &WorkItem) -> String {
+        format!("#{} {} {} {}", w.id, w.item_type, w.title, w.tags.join(" "))
+    }
+
+    /// Indices into `items` that pass the Work Items fuzzy filter.
+    pub fn visible_item_indices(&self) -> Vec<usize> {
+        if !self.list_filter.active() {
+            return (0..self.items.len()).collect();
+        }
+        self.items
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| self.list_filter.matches(&Self::item_haystack(w)))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The currently selected work item, mapping the list cursor through the
+    /// fuzzy filter to the underlying `items` entry.
+    fn selected_item(&self) -> Option<&WorkItem> {
+        let vis = self.visible_item_indices();
+        let pos = self.list_state.selected()?;
+        vis.get(pos).and_then(|i| self.items.get(*i))
+    }
+
+    fn clamp_list_selection(&mut self) {
+        let n = self.visible_item_indices().len();
+        if n == 0 {
+            self.list_state.select(None);
+        } else {
+            let pos = self.list_state.selected().unwrap_or(0).min(n - 1);
+            self.list_state.select(Some(pos));
+        }
+    }
+
+    fn active_filter(&self) -> Option<&FuzzyFilter> {
+        match self.context() {
+            Context::WorkItems => Some(&self.list_filter),
+            Context::Tree => Some(&self.tree_filter),
+            _ => None,
+        }
+    }
+
+    fn active_filter_mut(&mut self) -> Option<&mut FuzzyFilter> {
+        match self.context() {
+            Context::WorkItems => Some(&mut self.list_filter),
+            Context::Tree => Some(&mut self.tree_filter),
+            _ => None,
+        }
+    }
+
+    /// True while the active pane's search bar is capturing input.
+    pub fn filter_searching(&self) -> bool {
+        self.active_filter().is_some_and(|f| f.searching())
+    }
+
+    /// True if a fuzzy filter is in effect in the active pane.
+    pub fn filter_active(&self) -> bool {
+        self.active_filter().is_some_and(|f| f.active())
+    }
+
+    pub fn open_search(&mut self) {
+        if let Some(f) = self.active_filter_mut() {
+            f.open();
+        }
+    }
+
+    pub fn search_input_empty(&self) -> bool {
+        self.active_filter().is_none_or(|f| f.input_is_empty())
+    }
+
+    /// Apply a key to the search input (live filtering).
+    pub fn search_handle(&mut self, key: crossterm::event::KeyEvent) {
+        if let Some(f) = self.active_filter_mut()
+            && let Some(inp) = f.input.as_mut() {
+                inp.handle(key);
+            }
+        self.after_filter_change();
+    }
+
+    pub fn search_commit(&mut self) {
+        if let Some(f) = self.active_filter_mut() {
+            f.commit();
+        }
+        self.after_filter_change();
+    }
+
+    pub fn search_cancel(&mut self) {
+        if let Some(f) = self.active_filter_mut() {
+            f.cancel();
+        }
+        self.after_filter_change();
+    }
+
+    pub fn search_pop_tag(&mut self) {
+        if let Some(f) = self.active_filter_mut() {
+            f.tags.pop();
+        }
+        self.after_filter_change();
+    }
+
+    /// Clear all filter tags + input in the active pane.
+    pub fn clear_filter(&mut self) {
+        if let Some(f) = self.active_filter_mut() {
+            f.tags.clear();
+            f.input = None;
+        }
+        self.after_filter_change();
+    }
+
+    /// Re-clamp the selection (and rebuild the tree) after the filter changes.
+    fn after_filter_change(&mut self) {
+        match self.context() {
+            Context::WorkItems => self.clamp_list_selection(),
+            Context::Tree => self.rebuild_tree(),
+            _ => {}
+        }
     }
 
     /// Kick off a non-blocking refresh on a background thread. The UI keeps
@@ -1041,8 +1240,47 @@ impl App {
             }
             self.tree_flatten(root, 0, &mut flat);
         }
+        if self.tree_filter.active() {
+            flat = self.apply_tree_filter(flat);
+        }
         self.tree.flat = flat;
         self.clamp_tree_selection();
+    }
+
+    /// Keep only tree rows that fuzzy-match the filter, plus the ancestor path
+    /// of each match (so the matches stay located in the hierarchy). Drops the
+    /// "…" marker while filtering.
+    fn apply_tree_filter(&self, flat: Vec<TreeRow>) -> Vec<TreeRow> {
+        let shown: HashSet<u32> = flat
+            .iter()
+            .filter_map(|r| match r {
+                TreeRow::Node { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        let mut keep: HashSet<u32> = HashSet::new();
+        for id in &shown {
+            let matches = self
+                .tree_cache
+                .get(id)
+                .is_some_and(|w| self.tree_filter.matches(&Self::item_haystack(w)));
+            if matches {
+                keep.insert(*id);
+                // Walk up the ancestor chain, within the shown set.
+                let mut cur = *id;
+                while let Some(p) = self.tree_cache.get(&cur).and_then(|w| w.parent) {
+                    if shown.contains(&p) {
+                        keep.insert(p);
+                        cur = p;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        flat.into_iter()
+            .filter(|r| matches!(r, TreeRow::Node { id, .. } if keep.contains(id)))
+            .collect()
     }
 
     fn tree_flatten(&self, id: u32, depth: usize, out: &mut Vec<TreeRow>) {
@@ -1121,12 +1359,7 @@ impl App {
 
     /// `v` from the work-items list: focus the tree on the selected item.
     fn view_in_tree(&mut self) {
-        let Some(id) = self
-            .list_state
-            .selected()
-            .and_then(|i| self.items.get(i))
-            .map(|w| w.id)
-        else {
+        let Some(id) = self.selected_item().map(|w| w.id) else {
             self.status = "no item selected".into();
             return;
         };
@@ -1147,11 +1380,7 @@ impl App {
     fn active_item_id(&self) -> Option<u32> {
         match self.context() {
             Context::Tree => self.tree_selected_id(),
-            Context::WorkItems => self
-                .list_state
-                .selected()
-                .and_then(|i| self.items.get(i))
-                .map(|w| w.id),
+            Context::WorkItems => self.selected_item().map(|w| w.id),
             Context::Detail => self.current.as_ref().map(|w| w.id),
             _ => None,
         }
@@ -1416,11 +1645,12 @@ impl App {
                 }
             }
             Context::WorkItems => {
-                if self.items.is_empty() {
+                let n = self.visible_item_indices().len();
+                if n == 0 {
                     return;
                 }
                 let cur = self.list_state.selected().unwrap_or(0) as isize;
-                let next = (cur + delta).clamp(0, self.items.len() as isize - 1);
+                let next = (cur + delta).clamp(0, n as isize - 1);
                 self.list_state.select(Some(next as usize));
             }
             Context::Detail => match self.detail_focus {
@@ -1462,9 +1692,12 @@ impl App {
                     self.tree.selected = nodes[idx];
                 }
             }
-            Context::WorkItems if !self.items.is_empty() => {
-                let idx = target.clamp(0, self.items.len() as isize - 1) as usize;
-                self.list_state.select(Some(idx));
+            Context::WorkItems => {
+                let n = self.visible_item_indices().len();
+                if n > 0 {
+                    let idx = target.clamp(0, n as isize - 1) as usize;
+                    self.list_state.select(Some(idx));
+                }
             }
             Context::Detail => match self.detail_focus {
                 DetailFocus::Relations => {
@@ -1497,8 +1730,7 @@ impl App {
                 }
             }
             Context::WorkItems => {
-                if let Some(idx) = self.list_state.selected()
-                    && let Some(item) = self.items.get(idx) {
+                if let Some(item) = self.selected_item() {
                         let id = item.id;
                         self.open_id(id);
                     }
@@ -2419,6 +2651,64 @@ mod tests {
         assert!(!app.tree_loading());
         assert!(tree_node_ids(&app).contains(&1001));
         assert!(tree_node_ids(&app).contains(&1002));
+    }
+
+    fn search_chars(app: &mut App, s: &str) {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for c in s.chars() {
+            app.search_handle(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+    }
+
+    #[test]
+    fn work_items_fuzzy_filter_narrows_and_clears() {
+        let mut app = ready_app();
+        let total = app.items.len();
+        assert!(total > 1);
+        // Open the search bar and type a query that matches one item's title.
+        app.open_search();
+        assert!(app.filter_searching());
+        let target = app.items[0].title.clone();
+        let word = target.split_whitespace().next().unwrap().to_string();
+        search_chars(&mut app, &word);
+        let narrowed = app.visible_item_indices().len();
+        assert!(narrowed >= 1 && narrowed <= total);
+        // Every visible item matches the live query.
+        for i in app.visible_item_indices() {
+            assert!(app.list_filter.matches(&App::item_haystack(&app.items[i])));
+        }
+        // Commit it as a tag, then clear everything.
+        app.search_commit();
+        assert!(!app.filter_searching());
+        assert_eq!(app.list_filter.tags.len(), 1);
+        app.clear_filter();
+        assert!(!app.filter_active());
+        assert_eq!(app.visible_item_indices().len(), total);
+    }
+
+    #[test]
+    fn work_items_filter_maps_selection_to_real_item() {
+        let mut app = ready_app();
+        // Filter to a single known item by its id, then "open" it.
+        app.open_search();
+        search_chars(&mut app, "1004");
+        app.search_commit();
+        app.list_state.select(Some(0));
+        assert_eq!(app.selected_item().map(|w| w.id), Some(1004));
+    }
+
+    #[test]
+    fn tree_fuzzy_filter_keeps_matches_and_ancestors() {
+        let mut app = ready_app();
+        app.load_tree_for(1001);
+        app.settle_tree();
+        // Filter the tree to the story whose title contains "Edit work" (#1003).
+        app.tree_filter.input = Some(crate::ui::input::TextInput::new("Edit work"));
+        app.rebuild_tree();
+        let ids = tree_node_ids(&app);
+        assert!(ids.contains(&1003), "matching node kept");
+        assert!(ids.contains(&1001), "ancestor kept for context");
+        assert!(!ids.contains(&1002), "non-matching sibling dropped");
     }
 
     #[test]
