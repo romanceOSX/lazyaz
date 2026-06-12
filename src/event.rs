@@ -264,8 +264,7 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
         KeyCode::Esc if ctx == Context::Detail => app.apply(Action::Back),
 
         // Work-items context
-        KeyCode::Char('f') if ctx == Context::WorkItems => app.apply(Action::NextFilter),
-        KeyCode::Char('F') if ctx == Context::WorkItems => app.apply(Action::PrevFilter),
+        KeyCode::Char('f') if ctx == Context::WorkItems => app.apply(Action::OpenTimeframeFilter),
         KeyCode::Char('r') if ctx == Context::WorkItems => app.apply(Action::Reload),
         KeyCode::Char('v') if ctx == Context::WorkItems => app.apply(Action::ViewInTree),
         KeyCode::Char('i')
@@ -275,11 +274,6 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('t') if ctx == Context::WorkItems => {
             app.apply(Action::OpenTypeFilter)
-        }
-        KeyCode::Char('c')
-            if matches!(ctx, Context::WorkItems | Context::Tree) =>
-        {
-            app.apply(Action::OpenCustomTimeframe)
         }
 
         // Detail context

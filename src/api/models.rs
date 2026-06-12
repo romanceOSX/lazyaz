@@ -133,6 +133,7 @@ impl Date {
     }
 
     /// Parse a leading `YYYY-MM-DD` (ignores any time suffix).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn from_iso(s: &str) -> Option<Self> {
         let date = s.get(0..10)?;
         let mut p = date.split('-');
@@ -226,35 +227,28 @@ pub fn month_name(month: u32) -> &'static str {
     NAMES[(month.clamp(1, 12) - 1) as usize]
 }
 
-/// Timeframe filter applied to the assigned-items list. The first four are
-/// quick presets cycled with `f`/`F`; `Custom` is an explicit date range.
+/// A change-date window for the timeframe filter. `from` and `to` are each
+/// optional: a start-only window means "on or after", an end-only window "on or
+/// before", and both unset means no constraint (the neutral "All").
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum Timeframe {
-    Today,
-    ThisWeek,
-    ThisMonth,
-    #[default]
-    All,
-    /// An explicit `[from, to]` change-date window.
-    Custom { from: Date, to: Date },
+pub struct Timeframe {
+    pub from: Option<Date>,
+    pub to: Option<Date>,
 }
 
 impl Timeframe {
-    /// The cycle of quick presets reachable via `f`/`F` (excludes `Custom`).
-    pub const ALL: [Timeframe; 4] = [
-        Timeframe::Today,
-        Timeframe::ThisWeek,
-        Timeframe::ThisMonth,
-        Timeframe::All,
-    ];
+    /// No date constraint (the neutral state — lets the iteration filter own
+    /// time filtering instead).
+    pub fn is_empty(&self) -> bool {
+        self.from.is_none() && self.to.is_none()
+    }
 
     pub fn label(&self) -> String {
-        match self {
-            Timeframe::Today => "Today".into(),
-            Timeframe::ThisWeek => "This week".into(),
-            Timeframe::ThisMonth => "This month".into(),
-            Timeframe::All => "All".into(),
-            Timeframe::Custom { from, to } => format!("{}…{}", from.to_iso(), to.to_iso()),
+        match (self.from, self.to) {
+            (None, None) => "All".into(),
+            (Some(f), None) => format!("≥ {}", f.to_iso()),
+            (None, Some(t)) => format!("≤ {}", t.to_iso()),
+            (Some(f), Some(t)) => format!("{}…{}", f.to_iso(), t.to_iso()),
         }
     }
 
@@ -262,47 +256,38 @@ impl Timeframe {
     /// Used by the in-memory (mock) backend; the real backend pushes the
     /// equivalent clause into WIQL instead (see [`Timeframe::wiql_clause`]).
     pub fn matches_days_ago(&self, days_ago: u32) -> bool {
-        match self {
-            Timeframe::Today => days_ago == 0,
-            Timeframe::ThisWeek => days_ago <= 7,
-            Timeframe::ThisMonth => days_ago <= 30,
-            Timeframe::All => true,
-            Timeframe::Custom { from, to } => {
-                // changed-date = today - days_ago; keep it within [from, to].
-                let today = Date::today();
-                let lo = to.days_until(today).max(0); // newest bound → smallest days-ago
-                let hi = from.days_until(today); // oldest bound → largest days-ago
-                let days_ago = days_ago as i64;
-                days_ago >= lo && days_ago <= hi
+        if self.is_empty() {
+            return true;
+        }
+        let changed = Date::today().add_days(-(days_ago as i64)).to_epoch_days();
+        if let Some(f) = self.from
+            && changed < f.to_epoch_days() {
+                return false;
             }
-        }
+        if let Some(t) = self.to
+            && changed > t.to_epoch_days() {
+                return false;
+            }
+        true
     }
 
-    /// The `[System.ChangedDate]` WIQL clause for this timeframe, or `None` for
-    /// `All` (no constraint).
+    /// The `[System.ChangedDate]` WIQL clause for this window, or `None` when
+    /// empty (no constraint).
     pub fn wiql_clause(&self) -> Option<String> {
-        match self {
-            Timeframe::Today => Some("[System.ChangedDate] >= @Today".into()),
-            Timeframe::ThisWeek => Some("[System.ChangedDate] >= @Today - 7".into()),
-            Timeframe::ThisMonth => Some("[System.ChangedDate] >= @Today - 30".into()),
-            Timeframe::All => None,
-            Timeframe::Custom { from, to } => Some(format!(
-                "[System.ChangedDate] >= '{}' AND [System.ChangedDate] <= '{}'",
-                from.to_iso(),
-                to.to_iso()
-            )),
+        let mut parts = Vec::new();
+        if let Some(f) = self.from {
+            parts.push(format!("[System.ChangedDate] >= '{}'", f.to_iso()));
+        }
+        if let Some(t) = self.to {
+            parts.push(format!("[System.ChangedDate] <= '{}'", t.to_iso()));
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" AND "))
         }
     }
 
-    pub fn next(&self) -> Timeframe {
-        let idx = Self::ALL.iter().position(|t| t == self).unwrap_or(0);
-        Self::ALL[(idx + 1) % Self::ALL.len()]
-    }
-
-    pub fn prev(&self) -> Timeframe {
-        let idx = Self::ALL.iter().position(|t| t == self).unwrap_or(0);
-        Self::ALL[(idx + Self::ALL.len() - 1) % Self::ALL.len()]
-    }
 }
 
 /// A team iteration (sprint): a node in the `System.IterationPath` hierarchy,

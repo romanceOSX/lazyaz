@@ -1,4 +1,4 @@
-use crate::api::models::{Timeframe, WorkItemState};
+use crate::api::models::WorkItemState;
 use crate::app::App;
 use crate::ui::theme;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -22,18 +22,15 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
         .constraints([Constraint::Length(1), Constraint::Min(1)])
         .split(area);
 
-    // Filter row.
-    let mut spans = vec![Span::styled("timeframe: ", theme::label())];
-    for tf in Timeframe::ALL {
-        let style = if tf == app.timeframe {
-            Style::default().fg(Color::Black).bg(theme::ACCENT)
-        } else {
-            Style::default().fg(theme::DIM)
-        };
-        spans.push(Span::styled(format!(" {} ", tf.label()), style));
-        spans.push(Span::raw(" "));
-    }
-    spans.push(Span::styled("  (f/F to change)", Style::default().fg(theme::DIM)));
+    // Filter hint row: the active time filter plus how to change the filters.
+    let spans = vec![
+        Span::styled("filter ", theme::label()),
+        Span::styled(app.time_filter_label(), Style::default().fg(Color::Magenta)),
+        Span::styled(
+            "   f timeframe · i iteration · t type",
+            Style::default().fg(theme::DIM),
+        ),
+    ];
     f.render_widget(Paragraph::new(Line::from(spans)), rows[0]);
 
     // List.

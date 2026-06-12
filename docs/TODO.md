@@ -108,3 +108,66 @@ What would be an ergonomic way of achieving this within the TUI?
       defaulting to the current sprint on first load, you land on the current
       iteration's work items.
 
+## Re-designing the app
+- [x] Status: implemented
+
+Summary of what changed:
+- `Timeframe` is now a `{ from: Option<Date>, to: Option<Date> }` window (was a
+  preset enum). Open-ended ranges work: start-only → `[System.ChangedDate] >=`,
+  end-only → `<=`, both unset → no constraint.
+- The `f`/`F` preset cycling is gone. `f` (Work Items) now opens the timeframe
+  window (`OpenTimeframeFilter`); `i` opens the iteration picker. The two are
+  still mutually exclusive (one resets the other).
+- New timeframe window (`src/ui/date_range.rs`): Start/End rows, each toggled
+  on/off with Space (open-ended). `h`/`l` (←/→) move between Y/M/D fields; `k`/↑
+  increase, `j`/↓ decrease, or type digits. `c` opens the calendar
+  (`src/ui/calendar.rs`) to pick the range visually.
+- Tree view: already independent of the time filters, already not the boot
+  window (Work Items is), and `v` already opens it centred on the current item
+  with parents, children and siblings uncollapsed.
+
+### The concept of 'time filters'
+*Note that this only applies to the 'Work Items' window, but it may impact some other windows
+int the future*
+
+Time filters are entities that filter the displayed *Work Items* for the initial stage there should
+be two kinds of *Time filters*:
+- Time frame filter
+- Iteration Filters
+**Only one type of filter can exist at the time**
+
+### Iteration filters
+These filters filter by Iteration, the user will select them by the use of the Itereation
+fzf picker (which I believe it is already in place, implemented)
+
+### Time frame filter
+This type of filter represent a 'time window', the user should be able to select an
+starting time and end time on a new floating window
+When selecting the date the user should be able to increment the value under the cursor
+if the user uses 'j'/down arrow to decrease, 'k'/up arrow to increase, or type it manually
+If the user uses 'l'/right arrow, or 'h' left arrow, they will be able to navigate to the
+next field of the date.
+
+Additionally the user will also be able to select the 'range' date visually from
+a 'calendar'
+
+If the user only declares an start date, then the filter will query the work items above
+that date, on the other hand if the user just selects an end date, the query will show all the
+stories up to that day
+
+### Things to remove
+Right now if we press 'f' on the Work Items window we switch around the 'time filter',
+remove this, this is not necesarry anymore.
+
+### moving the 'Tree view' window
+The Tree view is independent of the time filters (for now), it should not be the initial
+window when the app boots, it should be the 'Work Items' one.
+Additionally the user is able to spawn the Tree View with the cursor under the current work item when
+they press the key 'v', they will get redirected to the 'Tree View' window with the current work item with its
+children uncollapsed, their parents, and their siblings uncollapsed, the user will be able to uncollapse and navigate
+through the tree
+
+## Considerations
+Literally, feel free to remove any unwanted code or do any massive refactoring, we do not care about breaking
+jhanges or maintaing any code, this is a Proof of Concept
+

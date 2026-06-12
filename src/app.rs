@@ -395,7 +395,7 @@ impl App {
             auth,
             items: Vec::new(),
             list_state: ListState::default(),
-            timeframe: Timeframe::All,
+            timeframe: Timeframe::default(),
             iterations: Vec::new(),
             selected_iterations: Vec::new(),
             iteration_picker: None,
@@ -1102,18 +1102,10 @@ impl App {
             Action::Up => self.move_selection(-1),
             Action::Top => self.set_selection(0),
             Action::Bottom => self.set_selection(isize::MAX),
-            Action::NextFilter => {
-                self.set_timeframe(self.timeframe.next());
-                self.request_refresh();
-            }
-            Action::PrevFilter => {
-                self.set_timeframe(self.timeframe.prev());
-                self.request_refresh();
-            }
             Action::Reload => self.request_refresh(),
             Action::OpenIterationFilter => self.open_iteration_picker(),
             Action::OpenTypeFilter => self.open_type_picker(),
-            Action::OpenCustomTimeframe => {
+            Action::OpenTimeframeFilter => {
                 self.date_range = Some(DateRangeInput::new(self.timeframe));
             }
             Action::Open => self.open(),
@@ -1548,7 +1540,7 @@ impl App {
     /// `All` leaves iterations untouched (it is the neutral "no time filter").
     fn set_timeframe(&mut self, tf: Timeframe) {
         self.timeframe = tf;
-        if tf != Timeframe::All {
+        if !tf.is_empty() {
             self.selected_iterations.clear();
         }
     }
@@ -1560,7 +1552,7 @@ impl App {
         self.iteration_picker = None;
         // Iteration-based filtering replaces any active timeframe window.
         if !self.selected_iterations.is_empty() {
-            self.timeframe = Timeframe::All;
+            self.timeframe = Timeframe::default();
         }
         self.request_refresh();
     }
@@ -2093,7 +2085,7 @@ mod tests {
             ..Default::default()
         };
         let mut app = App::new(cfg);
-        app.timeframe = Timeframe::All;
+        app.timeframe = Timeframe::default();
         app.reload_items();
         app
     }
@@ -2120,7 +2112,7 @@ mod tests {
             ..Default::default()
         };
         let mut app = App::new(cfg);
-        app.timeframe = Timeframe::All;
+        app.timeframe = Timeframe::default();
         app.items.clear();
 
         // Kick off a background refresh; the call returns immediately.
@@ -2208,32 +2200,35 @@ mod tests {
 
     #[test]
     fn timeframe_and_iteration_filters_are_mutually_exclusive() {
+        use crate::api::models::Date;
+        let window = Timeframe { from: Some(Date::today()), to: None };
         let mut app = ready_app();
         // Selecting iterations clears any active timeframe window.
-        app.set_timeframe(Timeframe::ThisWeek);
-        assert_eq!(app.timeframe, Timeframe::ThisWeek);
+        app.set_timeframe(window);
+        assert_eq!(app.timeframe, window);
         app.open_iteration_picker();
         app.iteration_picker.as_mut().unwrap().selected = vec!["Proj\\Sprint 24".into()];
         app.iteration_picker_commit();
         assert_eq!(app.selected_iterations, vec!["Proj\\Sprint 24".to_string()]);
-        assert_eq!(app.timeframe, Timeframe::All, "iteration filter clears timeframe");
+        assert!(app.timeframe.is_empty(), "iteration filter clears timeframe");
 
         // Setting a timeframe window clears the iteration selection.
-        app.set_timeframe(Timeframe::Today);
-        assert_eq!(app.timeframe, Timeframe::Today);
+        app.set_timeframe(window);
+        assert_eq!(app.timeframe, window);
         assert!(app.selected_iterations.is_empty(), "timeframe clears iterations");
 
-        // `All` is the neutral state and does NOT clear iterations.
+        // An empty window is the neutral state and does NOT clear iterations.
         app.selected_iterations = vec!["Proj\\Sprint 24".into()];
-        app.set_timeframe(Timeframe::All);
+        app.set_timeframe(Timeframe::default());
         assert_eq!(app.selected_iterations, vec!["Proj\\Sprint 24".to_string()]);
     }
 
     #[test]
     fn tree_is_independent_of_timeframe_filter() {
+        use crate::api::models::Date;
         let mut app = ready_app();
         // Narrow the list filter so most items drop out of the work-items list…
-        app.timeframe = Timeframe::Today;
+        app.timeframe = Timeframe { from: Some(Date::today()), to: None };
         app.reload_items();
         // …yet the relationship tree, anchored on #1004, still shows the whole
         // family (#1005 was last changed 12 days ago, well outside "Today").
@@ -2559,7 +2554,7 @@ mod tests {
         let back: SessionState = toml::from_str(&text).unwrap();
         assert_eq!(back.tab, Tab::Detail);
         assert_eq!(back.current_id, Some(1002));
-        assert_eq!(back.timeframe, Timeframe::All);
+        assert_eq!(back.timeframe, Timeframe::default());
     }
 
     #[test]
@@ -2661,7 +2656,7 @@ mod tests {
             ..Default::default()
         };
         let mut app = App::new(cfg);
-        app.timeframe = Timeframe::All;
+        app.timeframe = Timeframe::default();
         // Mimic the real startup: kick off the first async refresh and drain it.
         app.request_refresh();
         app.settle();
@@ -2673,46 +2668,50 @@ mod tests {
     }
 
     #[test]
-    fn custom_timeframe_commit_sets_range() {
-        use crate::api::models::Date;
+    fn opening_timeframe_filter_routes_through_context() {
         let mut app = ready_app();
-        app.apply(Action::OpenCustomTimeframe);
+        app.apply(Action::OpenTimeframeFilter);
+        assert!(app.date_range.is_some());
+        // The date-range modal routes through the iteration-filter context.
         assert_eq!(app.context(), Context::IterationFilter);
-        // Simulate a valid range entry then commit.
-        let from = Date::new(2020, 1, 1);
-        let to = Date::today();
-        app.timeframe = Timeframe::Custom { from, to };
-        app.date_range = None;
-        assert!(matches!(app.timeframe, Timeframe::Custom { .. }));
-        // The label reflects the range.
-        assert!(app.timeframe.label().contains('…'));
     }
 
     #[test]
-    fn timeframe_matches_days_ago_presets() {
-        assert!(Timeframe::Today.matches_days_ago(0));
-        assert!(!Timeframe::Today.matches_days_ago(1));
-        assert!(Timeframe::ThisWeek.matches_days_ago(7));
-        assert!(!Timeframe::ThisWeek.matches_days_ago(8));
-        assert!(Timeframe::All.matches_days_ago(999));
-    }
-
-    #[test]
-    fn timeframe_wiql_clause_for_presets() {
-        assert!(Timeframe::All.wiql_clause().is_none());
-        assert!(
-            Timeframe::ThisMonth
-                .wiql_clause()
-                .unwrap()
-                .contains("@Today - 30")
-        );
+    fn timeframe_window_matches_and_labels() {
         use crate::api::models::Date;
-        let tf = Timeframe::Custom {
-            from: Date::new(2024, 1, 1),
-            to: Date::new(2024, 2, 1),
+        let today = Date::today();
+        // Start-only window ("on or after" today): only same-day items pass.
+        let from_only = Timeframe { from: Some(today), to: None };
+        assert!(from_only.matches_days_ago(0));
+        assert!(!from_only.matches_days_ago(1));
+        assert!(from_only.label().starts_with('≥'));
+
+        // End-only window ("on or before" today): everything up to now passes.
+        let to_only = Timeframe { from: None, to: Some(today) };
+        assert!(to_only.matches_days_ago(0));
+        assert!(to_only.matches_days_ago(999));
+        assert!(to_only.label().starts_with('≤'));
+
+        // Empty window = no constraint.
+        assert!(Timeframe::default().is_empty());
+        assert!(Timeframe::default().matches_days_ago(999));
+    }
+
+    #[test]
+    fn timeframe_wiql_clause_for_windows() {
+        use crate::api::models::Date;
+        assert!(Timeframe::default().wiql_clause().is_none());
+        let tf = Timeframe {
+            from: Some(Date::new(2024, 1, 1)),
+            to: Some(Date::new(2024, 2, 1)),
         };
         let clause = tf.wiql_clause().unwrap();
         assert!(clause.contains("2024-01-01") && clause.contains("2024-02-01"));
+        assert!(clause.contains(">=") && clause.contains("<="));
+        // Start-only window emits just the lower bound.
+        let lo = Timeframe { from: Some(Date::new(2024, 1, 1)), to: None };
+        let c = lo.wiql_clause().unwrap();
+        assert!(c.contains(">=") && !c.contains("<="));
     }
 
     #[test]
@@ -2724,13 +2723,13 @@ mod tests {
         item.changed_days_ago = 0;
         // UNDER-style prefix match on the iteration path.
         let f = WorkItemFilter {
-            timeframe: Timeframe::All,
+            timeframe: Timeframe::default(),
             iterations: vec!["Proj\\Sprint 24".into()],
             item_types: Vec::new(),
         };
         assert!(f.matches(&item));
         let f2 = WorkItemFilter {
-            timeframe: Timeframe::All,
+            timeframe: Timeframe::default(),
             iterations: vec!["Proj\\Sprint 25".into()],
             item_types: Vec::new(),
         };
