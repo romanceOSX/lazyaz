@@ -331,6 +331,16 @@ pub struct App {
     pushing: bool,
     push_tx: Sender<PushOutcome>,
     push_rx: Receiver<PushOutcome>,
+
+    /// Tree fetching runs on a background thread so walking the tree never
+    /// freezes the UI; nodes populate progressively as they arrive.
+    tree_pending: HashSet<u32>,
+    tree_tx: Sender<(u32, Result<WorkItem, String>)>,
+    tree_rx: Receiver<(u32, Result<WorkItem, String>)>,
+    /// When the focus item arrives, re-root the view on its parent.
+    tree_reroot_focus: Option<u32>,
+    /// Move the cursor onto this node once it becomes visible.
+    tree_select_after: Option<u32>,
 }
 
 /// Result of a background push of the open item's pending edits.
@@ -398,6 +408,7 @@ impl App {
         let (refresh_tx, refresh_rx) = std::sync::mpsc::channel();
         let (live_tx, live_rx) = std::sync::mpsc::channel();
         let (push_tx, push_rx) = std::sync::mpsc::channel();
+        let (tree_tx, tree_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             wizard,
             // Default landing view: the current iteration's work items.
@@ -456,6 +467,11 @@ impl App {
             pushing: false,
             push_tx,
             push_rx,
+            tree_pending: HashSet::new(),
+            tree_tx,
+            tree_rx,
+            tree_reroot_focus: None,
+            tree_select_after: None,
             config,
         };
         if app.wizard.is_none() {
@@ -901,71 +917,110 @@ impl App {
             .is_some_and(|w| !w.children.is_empty())
     }
 
-    /// Fetch a work item into the tree cache (no-op if already cached).
-    /// Returns whether it is now present.
-    fn tree_fetch(&mut self, id: u32) -> bool {
-        if self.tree_cache.contains_key(&id) {
-            return true;
-        }
-        match self.client.get(id) {
-            Ok(item) => {
-                self.tree_cache.insert(id, item);
-                true
-            }
-            Err(_) => false,
-        }
+    /// True while tree nodes are being fetched in the background.
+    pub fn tree_loading(&self) -> bool {
+        !self.tree_pending.is_empty()
     }
 
-    /// Expand a node: fetch its direct children (one nest level) into the cache
-    /// and mark it expanded.
-    fn tree_expand_node(&mut self, id: u32) {
-        if !self.tree_fetch(id) {
+    /// Request the work items needed to render the current tree (the root plus
+    /// the children of every expanded node) on a background thread. Already
+    /// cached / in-flight ids are skipped, so this is cheap to call repeatedly.
+    fn tree_ensure_fetched(&mut self) {
+        let mut want: HashSet<u32> = HashSet::new();
+        if let Some(root) = self.tree_root {
+            want.insert(root);
+            let mut stack = vec![root];
+            while let Some(id) = stack.pop() {
+                if self.tree.expanded.contains(&id)
+                    && let Some(item) = self.tree_cache.get(&id) {
+                        for c in &item.children {
+                            if want.insert(*c) {
+                                stack.push(*c);
+                            }
+                        }
+                    }
+            }
+        }
+        let needed: Vec<u32> = want
+            .into_iter()
+            .filter(|id| !self.tree_cache.contains_key(id) && !self.tree_pending.contains(id))
+            .collect();
+        if needed.is_empty() {
             return;
         }
-        let children = self
-            .tree_cache
-            .get(&id)
-            .map(|w| w.children.clone())
-            .unwrap_or_default();
-        for c in children {
-            self.tree_fetch(c);
+        for id in &needed {
+            self.tree_pending.insert(*id);
         }
+        let client = self.client.clone_box();
+        let tx = self.tree_tx.clone();
+        std::thread::spawn(move || {
+            for id in needed {
+                let _ = tx.send((id, client.get(id).map_err(|e| e.to_string())));
+            }
+        });
+    }
+
+    /// Expand a node, fetching its children in the background.
+    fn tree_expand_node(&mut self, id: u32) {
         self.tree.expanded.insert(id);
+        self.tree_ensure_fetched();
+    }
+
+    /// Drain any tree fetches that have completed. Non-blocking; populates the
+    /// tree progressively so the UI never freezes while walking.
+    pub fn drain_tree(&mut self) {
+        let mut changed = false;
+        while let Ok((id, res)) = self.tree_rx.try_recv() {
+            self.tree_pending.remove(&id);
+            if let Ok(item) = res {
+                self.tree_cache.insert(id, item);
+            }
+            // Once the focus arrives we know its parent — re-root the view there
+            // so the focus is shown with its siblings.
+            if self.tree_reroot_focus == Some(id) {
+                self.tree_reroot_focus = None;
+                if let Some(p) = self.tree_cache.get(&id).and_then(|w| w.parent) {
+                    self.tree_root = Some(p);
+                    self.tree.expanded.insert(p);
+                }
+            }
+            changed = true;
+        }
+        if changed {
+            self.tree_ensure_fetched(); // pull in children newly discovered above
+            self.rebuild_tree();
+            // Land the cursor on a deferred target once it becomes visible.
+            if let Some(target) = self.tree_select_after
+                && self
+                    .tree
+                    .flat
+                    .iter()
+                    .any(|r| matches!(r, TreeRow::Node { id, .. } if *id == target))
+                {
+                    self.tree_select_node(target);
+                    self.tree_select_after = None;
+                }
+        }
     }
 
     /// Anchor the tree on `focus`: show its parent (one level up), the focus and
     /// its siblings (current level), and the focus's children (one level down).
-    /// Deeper levels are loaded lazily as the user expands nodes. Clears the
+    /// Fetching happens in the background; nodes appear progressively. Clears the
     /// cache so this doubles as a refresh.
     fn load_tree_for(&mut self, focus: u32) {
         self.tree_cache.clear();
+        self.tree_pending.clear();
         self.tree.expanded.clear();
-        if !self.tree_fetch(focus) {
-            self.status = format!("could not load #{focus}");
-            self.tree_focus = None;
-            self.tree_root = None;
-            self.tree.flat.clear();
-            return;
-        }
-        // Show the focus's own children.
-        self.tree_expand_node(focus);
-        // If it has a parent, root the view there and reveal the siblings.
-        let parent = self.tree_cache.get(&focus).and_then(|w| w.parent);
-        let root = if let Some(p) = parent {
-            self.tree_expand_node(p);
-            p
-        } else {
-            focus
-        };
         self.tree_focus = Some(focus);
-        self.tree_root = Some(root);
-        self.rebuild_tree();
-        self.tree.selected = self
-            .tree
-            .flat
-            .iter()
-            .position(|r| matches!(r, TreeRow::Node { id, .. } if *id == focus))
-            .unwrap_or(0);
+        // Show something as soon as the focus loads; re-root onto its parent once
+        // we learn it (handled in drain_tree).
+        self.tree_root = Some(focus);
+        self.tree_reroot_focus = Some(focus);
+        self.tree_select_after = Some(focus);
+        self.tree.expanded.insert(focus);
+        self.tree.flat.clear();
+        self.tree.selected = 0;
+        self.tree_ensure_fetched();
     }
 
     /// Re-fetch the current tree from scratch (the cache is the source of truth
@@ -973,7 +1028,7 @@ impl App {
     fn refresh_tree(&mut self) {
         if let Some(focus) = self.tree_focus {
             self.load_tree_for(focus);
-            self.status = "tree refreshed".into();
+            self.status = "refreshing tree…".into();
         }
     }
 
@@ -1284,25 +1339,40 @@ impl App {
         self.tree_select_node(sibs[next]);
     }
 
+    /// Select `id` now if it's visible, otherwise once it arrives (drain_tree).
+    fn tree_select_or_defer(&mut self, id: u32) {
+        if self
+            .tree
+            .flat
+            .iter()
+            .any(|r| matches!(r, TreeRow::Node { id: i, .. } if *i == id))
+        {
+            self.tree_select_node(id);
+        } else {
+            self.tree_select_after = Some(id);
+        }
+    }
+
     /// `L`: descend one level — select the first child of the current node
-    /// (expanding it first if needed).
+    /// (expanding it first if needed; the child may load in the background).
     fn tree_level_in(&mut self) {
-        let Some((id, depth)) = self.tree_current() else {
+        let Some((id, _)) = self.tree_current() else {
             return;
         };
         if !self.tree_has_children(id) {
             return;
         }
+        let first_child = self
+            .tree_cache
+            .get(&id)
+            .and_then(|w| w.children.first().copied());
         if !self.tree.expanded.contains(&id) {
             self.tree_expand_node(id);
             self.rebuild_tree();
         }
-        // The first child is the row immediately after the (still-selected) node.
-        let cur = self.tree.selected;
-        if let Some(TreeRow::Node { depth: d, .. }) = self.tree.flat.get(cur + 1)
-            && *d == depth + 1 {
-                self.tree.selected = cur + 1;
-            }
+        if let Some(child) = first_child {
+            self.tree_select_or_defer(child);
+        }
     }
 
     /// `H`: ascend one level — select the parent of the current node. If the
@@ -1323,13 +1393,13 @@ impl App {
         if parent_visible {
             self.tree_select_node(parent);
         } else {
-            // Current node is the shown root: fetch the parent level, re-root on
-            // it (revealing the root + its siblings) and move onto the parent.
-            self.tree_expand_node(parent); // fetches parent + its children
+            // Current node is the shown root: fetch the parent level (in the
+            // background), re-root on it and move onto the parent as it arrives.
             self.tree_root = Some(parent);
+            self.tree_expand_node(parent); // fetches parent + its children
             self.rebuild_tree();
-            self.tree_select_node(parent);
-            self.status = format!("#{parent} — walked up a level");
+            self.tree_select_or_defer(parent);
+            self.status = format!("#{parent} — walking up a level…");
         }
     }
 
@@ -2261,7 +2331,19 @@ mod tests {
             for _ in 0..3000 {
                 self.drain_push();
                 self.drain_refresh();
-                if !self.pushing && !self.loading {
+                self.drain_tree();
+                if !self.pushing && !self.loading && !self.tree_loading() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        /// Drive just the tree fetcher to completion (tests only).
+        fn settle_tree(&mut self) {
+            for _ in 0..3000 {
+                self.drain_tree();
+                if !self.tree_loading() {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(1));
@@ -2326,9 +2408,24 @@ mod tests {
     }
 
     #[test]
+    fn tree_loads_in_background_without_blocking() {
+        let mut app = ready_app();
+        // load_tree_for returns immediately, before any node has been fetched.
+        app.load_tree_for(1001);
+        assert!(app.tree_loading(), "tree should report loading right away");
+        assert!(tree_node_ids(&app).is_empty(), "nodes populate progressively");
+        // Draining in the background fills the tree without ever blocking.
+        app.settle_tree();
+        assert!(!app.tree_loading());
+        assert!(tree_node_ids(&app).contains(&1001));
+        assert!(tree_node_ids(&app).contains(&1002));
+    }
+
+    #[test]
     fn tree_flattens_and_collapses() {
         let mut app = ready_app();
         app.load_tree_for(1001); // anchor the tree on the epic
+        app.settle_tree();
         // Epic 1001 expanded shows its two story children (one nest level).
         assert!(tree_node_ids(&app).contains(&1002));
         // Select the epic and collapse it; children disappear.
@@ -2337,6 +2434,7 @@ mod tests {
         assert!(!tree_node_ids(&app).contains(&1002));
         // Expanding re-fetches and shows them again.
         app.apply(Action::TreeExpand);
+        app.settle_tree();
         assert!(tree_node_ids(&app).contains(&1002));
     }
 
@@ -2344,11 +2442,13 @@ mod tests {
     fn tree_lazy_loads_one_level_at_a_time() {
         let mut app = ready_app();
         app.load_tree_for(1001); // Epic → Stories (1002, 1003) shown…
+        app.settle_tree();
         // …but the grandchildren (Tasks 1004/1005 under 1002) are NOT loaded yet.
         assert!(!tree_node_ids(&app).contains(&1004));
         // Walking into #1002 fetches its children on demand.
         app.tree.selected = tree_node_row(&app, 1002);
         app.apply(Action::TreeExpand);
+        app.settle_tree();
         assert!(tree_node_ids(&app).contains(&1004));
     }
 
@@ -2356,6 +2456,7 @@ mod tests {
     fn tree_capital_jk_navigate_siblings() {
         let mut app = ready_app();
         app.load_tree_for(1001); // root #1001, children #1002 + #1003
+        app.settle_tree();
         app.tree.selected = tree_node_row(&app, 1002);
         app.apply(Action::TreeNextSibling); // → #1003 (its sibling)
         assert_eq!(tree_selected(&app), Some(1003));
@@ -2367,11 +2468,13 @@ mod tests {
     fn tree_h_at_root_walks_up_a_level() {
         let mut app = ready_app();
         app.load_tree_for(1004); // root = parent #1002, with "… more above" (#1001)
+        app.settle_tree();
         // The grandparent isn't loaded yet.
         assert!(!tree_node_ids(&app).contains(&1001));
         // Select the root (#1002) and press H to pull in the parent level.
         app.tree.selected = tree_node_row(&app, 1002);
         app.apply(Action::TreeLevelOut);
+        app.settle_tree();
         assert_eq!(tree_selected(&app), Some(1001)); // moved onto the grandparent
         assert!(tree_node_ids(&app).contains(&1001)); // now revealed
         assert!(tree_node_ids(&app).contains(&1002)); // old root still shown
@@ -2381,9 +2484,11 @@ mod tests {
     fn tree_capital_hl_navigate_levels() {
         let mut app = ready_app();
         app.load_tree_for(1001);
+        app.settle_tree();
         app.tree.selected = tree_node_row(&app, 1001);
         // L descends into the first child (#1002), expanding if needed.
         app.apply(Action::TreeLevelIn);
+        app.settle_tree();
         assert_eq!(tree_selected(&app), Some(1002));
         // H ascends back to the parent (#1001).
         app.apply(Action::TreeLevelOut);
@@ -2394,6 +2499,7 @@ mod tests {
     fn tree_open_navigates_to_detail() {
         let mut app = ready_app();
         app.load_tree_for(1002);
+        app.settle_tree();
         app.tab = Tab::Tree;
         app.tree.selected = tree_node_row(&app, 1002);
         app.apply(Action::Open);
@@ -2420,6 +2526,7 @@ mod tests {
         let idx = app.items.iter().position(|w| w.id == 1004).unwrap();
         app.list_state.select(Some(idx));
         app.view_in_tree();
+        app.settle_tree();
         assert_eq!(app.tab, Tab::Tree);
         // The view is rooted on the parent (#1002) showing the focus + siblings;
         // the focus is expanded (it has no children, so nothing nests).
@@ -2476,6 +2583,7 @@ mod tests {
         // (#1002) and sibling (#1005, last changed 12 days ago — outside the
         // window) because the tree fetches directly via the client.
         app.load_tree_for(1004);
+        app.settle_tree();
         let ids = tree_node_ids(&app);
         assert!(ids.contains(&1002), "parent shown regardless of timeframe");
         assert!(ids.contains(&1005), "sibling shown regardless of timeframe");

@@ -104,6 +104,13 @@ fn status_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             Style::default().fg(Color::Cyan),
         ));
     }
+    // Tree nodes loading in the background.
+    if app.tree_loading() {
+        spans.push(Span::styled(
+            format!("{} tree… ", app.spinner_frame()),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
     // Un-pushed local edits: show a ● badge and prompt to push.
     if app.has_pending() {
         spans.push(Span::styled(

@@ -24,21 +24,27 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             .into(),
             TreeRow::Node { id, depth } => {
                 let indent = "  ".repeat(*depth);
+                // A node still being fetched renders as a placeholder.
+                let Some(item) = app.tree_item(*id) else {
+                    return ListItem::new(Line::from(vec![
+                        Span::raw(indent),
+                        Span::styled(
+                            format!("{} #{id} loading…", app.spinner_frame()),
+                            Style::default().fg(theme::DIM),
+                        ),
+                    ]));
+                };
                 let marker = if app.tree_has_children(*id) {
                     if app.tree.expanded.contains(id) { "▾ " } else { "▸ " }
                 } else {
                     "• "
                 };
-                let (ty, title) = app
-                    .tree_item(*id)
-                    .map(|w| (w.item_type.clone(), w.title.clone()))
-                    .unwrap_or_else(|| ("?".into(), "(unknown)".into()));
                 ListItem::new(Line::from(vec![
                     Span::raw(indent),
                     Span::styled(marker, Style::default().fg(theme::ACCENT)),
                     Span::styled(format!("#{id} "), Style::default().fg(theme::DIM)),
-                    Span::styled(format!("{ty} "), Style::default().fg(Color::Magenta)),
-                    Span::raw(title),
+                    Span::styled(format!("{} ", item.item_type), Style::default().fg(Color::Magenta)),
+                    Span::raw(item.title.clone()),
                 ]))
             }
         })
@@ -49,12 +55,17 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         state.select(Some(app.tree.selected.min(app.tree.flat.len() - 1)));
     }
 
+    let title = if app.tree_loading() {
+        format!(" Relationships  {} updating… ", app.spinner_frame())
+    } else {
+        " Relationships (l/h expand·collapse · J/K sibling · H/L level · r refresh) ".to_string()
+    };
     f.render_stateful_widget(
         List::new(items)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" Relationships (l/h expand·collapse · Enter open · r refresh) ")
+                    .title(title)
                     .border_style(Style::default().fg(theme::DIM)),
             )
             .highlight_style(theme::selected_row())

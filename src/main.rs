@@ -131,7 +131,11 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
         // Wait for input. While a conflict menu is open or a refresh is in
         // flight we tick fast so the pulsing border / loading spinner animate;
         // otherwise we idle on a long timeout to avoid needless redraws.
-        let tick = if app.resolution.is_some() || app.is_loading() || app.is_pushing() {
+        let tick = if app.resolution.is_some()
+            || app.is_loading()
+            || app.is_pushing()
+            || app.tree_loading()
+        {
             Duration::from_millis(120)
         } else {
             Duration::from_secs(1)
@@ -146,6 +150,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
         app.live_poll();
         app.drain_live();
         app.drain_push();
+        app.drain_tree();
     }
     Ok(())
 }
