@@ -21,6 +21,11 @@ const TENANT: &str = "organizations";
 pub struct OAuthAuthenticator {
     http: reqwest::blocking::Client,
     state: Option<AuthState>,
+    /// Long-lived refresh token (from the `offline_access` scope) used to mint
+    /// fresh access tokens silently — so the user only signs in interactively
+    /// once every few months instead of ~hourly.
+    refresh_token: Option<String>,
+    account: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -28,6 +33,9 @@ struct CachedToken {
     access_token: String,
     expires_at: u64,
     account: String,
+    /// Persisted so a new access token can be minted without re-prompting.
+    #[serde(default)]
+    refresh_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -43,6 +51,7 @@ struct DeviceCodeResp {
 struct TokenResp {
     access_token: Option<String>,
     expires_in: Option<u64>,
+    refresh_token: Option<String>,
     error: Option<String>,
 }
 
@@ -60,36 +69,47 @@ fn cache_path() -> Result<PathBuf> {
 }
 
 impl OAuthAuthenticator {
-    /// Build an authenticator, loading a cached (unexpired) token if present.
+    /// Build an authenticator, loading the cached token + refresh token. The
+    /// access token is only adopted if still valid; the refresh token is kept
+    /// regardless so [`ensure_token`](Self::ensure_token) can silently renew it.
     pub fn new() -> Self {
         let http = reqwest::blocking::Client::builder()
             .user_agent("lazyaz")
             .build()
             .unwrap_or_default();
-        let state = Self::load_cache();
-        Self { http, state }
+        let cached = Self::load_cache();
+        let (state, refresh_token, account) = match cached {
+            Some(c) => {
+                let valid = c.expires_at > now_unix() + 60;
+                let state = valid.then(|| AuthState {
+                    account: c.account.clone(),
+                    token: c.access_token.clone(),
+                    scheme: AuthScheme::Bearer,
+                });
+                (state, c.refresh_token, c.account)
+            }
+            None => (None, None, "Entra ID user".to_string()),
+        };
+        Self {
+            http,
+            state,
+            refresh_token,
+            account,
+        }
     }
 
-    fn load_cache() -> Option<AuthState> {
+    fn load_cache() -> Option<CachedToken> {
         let path = cache_path().ok()?;
         let text = std::fs::read_to_string(path).ok()?;
-        let cached: CachedToken = serde_json::from_str(&text).ok()?;
-        // Treat tokens within 60s of expiry as stale.
-        if cached.expires_at <= now_unix() + 60 {
-            return None;
-        }
-        Some(AuthState {
-            account: cached.account,
-            token: cached.access_token,
-            scheme: AuthScheme::Bearer,
-        })
+        serde_json::from_str(&text).ok()
     }
 
-    fn save_cache(state: &AuthState, expires_in: u64) {
+    fn save_cache(state: &AuthState, expires_in: u64, refresh_token: Option<String>) {
         let cached = CachedToken {
             access_token: state.token.clone(),
             expires_at: now_unix() + expires_in,
             account: state.account.clone(),
+            refresh_token,
         };
         if let Ok(path) = cache_path() {
             if let Some(parent) = path.parent() {
@@ -106,7 +126,7 @@ impl OAuthAuthenticator {
         }
     }
 
-    fn device_flow(&self) -> Result<(String, u64)> {
+    fn device_flow(&self) -> Result<(String, u64, Option<String>)> {
         let dc: DeviceCodeResp = self
             .http
             .post(format!(
@@ -171,7 +191,7 @@ impl OAuthAuthenticator {
                 .context("parsing token response")?;
 
             if let Some(token) = resp.access_token {
-                return Ok((token, resp.expires_in.unwrap_or(3600)));
+                return Ok((token, resp.expires_in.unwrap_or(3600), resp.refresh_token));
             }
             match resp.error.as_deref() {
                 Some("authorization_pending") => {}
@@ -226,16 +246,77 @@ impl Default for OAuthAuthenticator {
     }
 }
 
+impl OAuthAuthenticator {
+    /// Ensure a usable access token, prompting the user as little as possible:
+    /// a still-valid cached token is reused; an expired one is renewed silently
+    /// via the refresh token; only if that fails (or `force_login`) do we run
+    /// the interactive device-code flow.
+    pub fn ensure_token(&mut self, force_login: bool) -> Result<()> {
+        if force_login {
+            self.login()?;
+            return Ok(());
+        }
+        if self.state.is_some() {
+            return Ok(()); // cached access token still valid
+        }
+        if self.refresh_token.is_some() && self.refresh().is_ok() {
+            return Ok(()); // silently renewed — no browser needed
+        }
+        self.login()?;
+        Ok(())
+    }
+
+    /// Exchange the refresh token for a fresh access token (and a rotated
+    /// refresh token). Persists the result so the next launch renews silently.
+    fn refresh(&mut self) -> Result<()> {
+        let rt = self
+            .refresh_token
+            .clone()
+            .ok_or_else(|| anyhow!("no refresh token"))?;
+        let resp: TokenResp = self
+            .http
+            .post(format!(
+                "https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/token"
+            ))
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("client_id", CLIENT_ID),
+                ("refresh_token", rt.as_str()),
+                ("scope", DEVOPS_SCOPE),
+            ])
+            .send()
+            .context("refreshing access token")?
+            .json()
+            .context("parsing refresh response")?;
+        let access = resp.access_token.ok_or_else(|| {
+            anyhow!("token refresh rejected: {}", resp.error.unwrap_or_default())
+        })?;
+        let expires_in = resp.expires_in.unwrap_or(3600);
+        // Entra rotates refresh tokens; fall back to the old one if absent.
+        let new_rt = resp.refresh_token.or(Some(rt));
+        let state = AuthState {
+            account: self.account.clone(),
+            token: access,
+            scheme: AuthScheme::Bearer,
+        };
+        Self::save_cache(&state, expires_in, new_rt.clone());
+        self.state = Some(state);
+        self.refresh_token = new_rt;
+        Ok(())
+    }
+}
+
 impl Authenticator for OAuthAuthenticator {
     fn login(&mut self) -> Result<AuthState> {
-        let (token, expires_in) = self.device_flow()?;
+        let (token, expires_in, refresh_token) = self.device_flow()?;
         let state = AuthState {
-            account: "Entra ID user".to_string(),
+            account: self.account.clone(),
             token,
             scheme: AuthScheme::Bearer,
         };
-        Self::save_cache(&state, expires_in);
+        Self::save_cache(&state, expires_in, refresh_token.clone());
         self.state = Some(state.clone());
+        self.refresh_token = refresh_token;
         Ok(state)
     }
 

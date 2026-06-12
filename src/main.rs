@@ -76,9 +76,11 @@ fn build_backends(cfg: &Config, want_login: bool) -> Result<Backend> {
     //    flow. We build the real backend even before org/project are configured
     //    so the first-run wizard can list the user's actual orgs and projects.
     let mut oauth = OAuthAuthenticator::new();
-    if oauth.token().is_none() || want_login {
-        oauth.login().context("Entra ID sign-in failed")?;
-    }
+    // Reuse a valid token, renew it silently via the refresh token, or sign in
+    // interactively only as a last resort (or when --login is passed).
+    oauth
+        .ensure_token(want_login)
+        .context("Entra ID sign-in failed")?;
     let token = oauth
         .token()
         .context("no Azure DevOps credentials available")?;

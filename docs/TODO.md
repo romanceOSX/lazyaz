@@ -9,9 +9,14 @@ live in `future-improvements.md`; this is the short checklist.
       live client, so org/project changes need a restart. Let the wizard
       reconstruct the client + authenticator in place.
 
-- [ ] **OAuth refresh-token rotation.** We request `offline_access` but don't use
-      the refresh token; on access-token expiry the user must `--login` again.
-      Persist + rotate the refresh token in `src/auth/oauth.rs`.
+- [x] **OAuth refresh-token rotation.** The `offline_access` refresh token is now
+      persisted in `token.json` and used to mint fresh access tokens silently:
+      `OAuthAuthenticator::ensure_token` reuses a valid token, else renews via the
+      (rotated) refresh token, else falls back to the interactive device-code
+      flow. So the user signs in interactively only ~every few months (refresh-
+      token lifetime) instead of ~hourly. Still at *startup* only — mid-session
+      access-token expiry isn't renewed yet (the client header is fixed at
+      launch); see the note below.
 
 - [ ] **Keychain token storage.** Token cache is plaintext at
       `config_dir/token.json` (0600). Move to the OS keychain (a lighter
