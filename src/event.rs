@@ -266,6 +266,12 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
         // Work-items context
         KeyCode::Char('f') if ctx == Context::WorkItems => app.apply(Action::OpenTimeframeFilter),
         KeyCode::Char('r') if ctx == Context::WorkItems => app.apply(Action::Reload),
+        KeyCode::Char('r') if ctx == Context::Tree => app.apply(Action::RefreshTree),
+        // Tree: J/K move between siblings, H/L move between levels (in/out).
+        KeyCode::Char('J') if ctx == Context::Tree => app.apply(Action::TreeNextSibling),
+        KeyCode::Char('K') if ctx == Context::Tree => app.apply(Action::TreePrevSibling),
+        KeyCode::Char('L') if ctx == Context::Tree => app.apply(Action::TreeLevelIn),
+        KeyCode::Char('H') if ctx == Context::Tree => app.apply(Action::TreeLevelOut),
         KeyCode::Char('v') if ctx == Context::WorkItems => app.apply(Action::ViewInTree),
         KeyCode::Char('i')
             if matches!(ctx, Context::WorkItems | Context::Tree) =>

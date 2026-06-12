@@ -167,7 +167,88 @@ they press the key 'v', they will get redirected to the 'Tree View' window with 
 children uncollapsed, their parents, and their siblings uncollapsed, the user will be able to uncollapse and navigate
 through the tree
 
+### Considerations
+Literally, feel free to remove any unwanted code or do any massive refactoring, we do not care about breaking
+jhanges or maintaing any code, this is a Proof of Concept
+
+## Tree View Window
+- [x] Status: implemented
+
+Implementation notes:
+- **Tab order** is now `[Work Items, Detail, Tree, Config]` (`Tab::ORDER`): Tree
+  sits after Work Items (and Detail) and before Config.
+- **Lazy, level-by-level walking.** The tree no longer fetches the whole
+  connected component. Anchored on a focus item (`v`), it shows the parent (one
+  up), the focus + its siblings (current level), and the focus's children (one
+  down). Deeper levels load only when you expand a node (`l`), which fetches just
+  that node's direct children. A collapsed node with children shows `▸`
+  (continues down); a `⋯` row at the top means there are more ancestors above.
+- **Cache + refresh.** Fetched items live in `App::tree_cache` and are reused as
+  you walk. `r` (in the Tree pane) re-fetches the current tree from scratch.
+- Files: `App::{tree_cache,tree_focus,tree_root}`, `TreeRow`,
+  `load_tree_for`/`tree_expand_node`/`tree_flatten` in `src/app.rs`;
+  `src/ui/tree.rs` rendering.
+
+Original notes:
+
+The tree view should not be the first int the tabs, it should be placed before the 'config' tab, after the 'Work Items' tab
+Conceptually the Tree View is a 'tree' diagram whose main purpose is showing the relationships among work items in a more intuitive and
+graphical way to the user, since ther are tons of work items in an organization we don't want to show everything, so we will
+rely in the user 'walking' the tree to progressively query the related parents, children, and siblings.
+
+### Interaction
+
+When the user opens the 'tree view' when hitting 'v' on a work item, it should get navigated
+to the tree view, under the current work item, the children of such work item should be displayed, at least up to the next
+'nest' level, it should not query all its children yet
+Ideally the user will only get displayed the current 'level', one before, and one after, with '...' indicating that the tree
+continues in such direction.
+
+The application should 'cache' these relationships, if the user wants to 'refresh' the tree, they should be able to do so through a
+keybinding. (note that this behaviour might change in the future)
+
 ## Considerations
 Literally, feel free to remove any unwanted code or do any massive refactoring, we do not care about breaking
 jhanges or maintaing any code, this is a Proof of Concept
+
+# Doubts
+- [x] Is there a way to get notified whenever a Work Item is added under a certain Work Item? Or is polling the only pawsible sollution?
+
+  **Answer: there are real push options, but none of them is a client-side
+  "subscribe" call — so for a local TUI like lazyaz, polling is the practical
+  path.** Breakdown:
+
+  - **Service Hooks (webhooks)** — Azure DevOps' first-class push mechanism. You
+    create a subscription for the `workitem.created` (or `workitem.updated`)
+    event, optionally filtered by area path / work-item type, and ADO POSTs a
+    JSON payload to an HTTPS endpoint you control. This is true push, no polling.
+    The catch for us: it needs a **publicly reachable server** to receive the
+    POST — a terminal app has nowhere to deliver it. You'd need a small relay
+    service (and there's no "notify me when a child is added under item X"
+    filter specifically; you'd subscribe to created events and check the parent
+    link yourself).
+  - **No client subscribe / long-poll in the REST API.** There is no supported
+    endpoint a client can hold open to be told "an item changed". The web UI
+    uses an internal SignalR feed, but that's not a public/supported API.
+  - **Efficient polling** is therefore the answer for lazyaz. Two good options:
+    - WIQL/`$expand` by `[System.ChangedDate] >= @lastChecked` to find recently
+      changed items, or query an item's children directly and diff.
+    - The **Reporting Work Item Revisions** endpoint
+      (`_apis/wit/reporting/workItemRevisions`) returns a `continuationToken`
+      "watermark", designed for incremental polling — you re-poll from the last
+      watermark and only get what changed. This is the cheapest way to poll
+      broadly.
+  - **Practical recommendation:** poll a parent's children (or a changed-since
+    watermark) on the existing background-refresh cadence; offer a manual
+    refresh key (already done for the tree: `r`). If real-time push ever becomes
+    a hard requirement, add a companion webhook relay — out of scope for a TUI
+    PoC.
+
+## Fuzzy finder
+- [] Status: implemented
+
+- [ ] We should be able to 'fuzzy filer' the items in any window, though as for an initial approach this
+   should only apply to the 'Work-Items' and 'Tree-View' windows, by hitting '/' we should be able to 
+   spawn in a 'fzf-style filter' and query any item that contains our request in the
+   current window
 
