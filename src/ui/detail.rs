@@ -2,7 +2,7 @@ use crate::app::{App, DetailFocus};
 use crate::ui::theme;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
@@ -144,9 +144,12 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         left[0],
     );
 
+    // Description and Notes are rendered as markdown (tui-markdown). The owned
+    // strings must outlive the borrowed `Text`, so keep them in scope.
+    let description = app.effective_field_value("description");
     f.render_widget(
-        Paragraph::new(app.effective_field_value("description"))
-            .wrap(Wrap { trim: true })
+        Paragraph::new(tui_markdown::from_str(&description))
+            .wrap(Wrap { trim: false })
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -158,14 +161,17 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     );
 
     let notes_val = app.effective_field_value("notes");
-    let notes_body = if notes_val.is_empty() {
-        Span::styled("no notes — press n to add", Style::default().fg(theme::DIM))
+    let notes_text: Text = if notes_val.is_empty() {
+        Text::from(Span::styled(
+            "no notes — press n to add",
+            Style::default().fg(theme::DIM),
+        ))
     } else {
-        Span::raw(notes_val)
+        tui_markdown::from_str(&notes_val)
     };
     f.render_widget(
-        Paragraph::new(Line::from(notes_body))
-            .wrap(Wrap { trim: true })
+        Paragraph::new(notes_text)
+            .wrap(Wrap { trim: false })
             .block(
                 Block::default()
                     .borders(Borders::ALL)

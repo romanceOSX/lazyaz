@@ -349,3 +349,15 @@ jhanges or maintaing any code, this is a Proof of Concept
 - [ ] enhance the report
 
 
+## home dashboard
+I want to create a new 'home dashboard' window, this window will always be the default window
+It should contain the following 'panes':
+- assigned work items pane
+    This should show the user's current iteration assigned items
+- points completed so far (circular diagram as an speedometer)
+    This should show a circular diagram that serves as a graphical intuitive quick way of looking at the completed points so far
+- Iteration vs points completed graph
+    This should be a grap that plots the completed points across the iterations
+- Days of the Iteration
+    This is sort of a 'calendar' that lets the user know the day of the iteration, current day and days left
+
